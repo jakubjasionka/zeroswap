@@ -1,0 +1,17 @@
+engine:
+  mode: auto
+  target_gpu_memory_utilization: 0.92  # Leave 8% for CUDA driver & workspace headroom
+  context_priority:
+    max_context_length: 32768          # Target context window for the primary orchestrator
+    kv_cache_dtype: fp8                # fp8 (1 byte/elem) or bf16/fp16 (2 bytes/elem)
+    block_size: 16                     # Standard PagedAttention block size
+  streaming:
+    enable_one_way_overwrite: true     # Eliminate DtoH transfers (0 ms offload via Static RAM Mirror)
+    enable_double_buffering: true      # Overlap PCIe HtoD DMA stream with Compute stream
+    pin_host_memory: true              # Use page-locked (cudaHostAlloc) RAM for golden image
+    cpu_fallback_max_tokens: 512       # Path B threshold for micro-prompts on AVX-512 CPU
+    dynamic_chunk_layers: 1            # Path C micro-chunk size when delta_tokens < delta_n_crit
+  guardrail:
+    enable_pii_sanitizer: true         # Mask PII, API keys, internal IPs before external/frontier calls
+    enable_task_splitter: true         # Decompose sensitive security/legal/medical queries into abstract micro-tasks
+    max_self_correction_retries: 3     # Inject feedback into orchestrator KV cache on guardrail rejection

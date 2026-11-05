@@ -1,0 +1,15 @@
+{
+  "device": "NVIDIA GeForce RTX 5090",
+  "slab_size_mb": 540.0,
+  "seq_len": 4096,
+  "baseline_resident_ttft_ms": 87.18,
+  "two_way_swap_ttft_ms": 403.22,
+  "two_way_swap_overhead_ms": 316.04,
+  "one_way_sync_ttft_ms": 105.69,
+  "one_way_sync_overhead_ms": 18.51,
+  "zeroswap_pipelined_ttft_ms": 87.1,
+  "zeroswap_pipelined_overhead_ms": 0.0,
+  "numerical_restoration_exact": true,
+  "kv_cache_invariant_preserved": true,
+  "cuda_graph_replayed_without_recapture": true
+}

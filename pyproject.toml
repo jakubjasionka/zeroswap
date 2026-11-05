@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zeroswap"
+version = "0.1.0"
+description = "Zero-Latency In-Flight Weight Swapping & Multiplexing Middleware for vLLM and Local Guardrail Models"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Jakub Jasionka"}
+]
+keywords = [
+    "vllm",
+    "cuda",
+    "weight-streaming",
+    "kv-cache",
+    "guardrail",
+    "pcie-pipelining",
+    "cuda-graphs",
+    "llm-inference",
+    "local-ai"
+]
+dependencies = [
+    "torch>=2.2.0",
+    "pyyaml>=6.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "httpx>=0.24.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+vllm = ["vllm>=0.6.0"]
+dev = ["pytest>=7.0.0", "pytest-asyncio>=0.21.0"]
+
+[project.scripts]
+zeroswap-tune = "zeroswap.tune:main"
+zeroswap-serve = "zeroswap.vllm_integration.openai_server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["zeroswap*"]
