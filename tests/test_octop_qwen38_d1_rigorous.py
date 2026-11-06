@@ -254,6 +254,32 @@ def test_octop_long_context_overflow_sliding_window_needle_detection(
     )
     assert plan_opt_192k["swapped_qwen_decoder_layers"] == 4
 
+    # 3. K8V4 asymmetric KV Cache (Keys 8-bit FP8 + Values 4-bit INT4 = effective 6-bit, -25% KV VRAM):
+    #    Cuts 256K main KV from 8,192 MiB -> 6,144 MiB (-2,048 MiB), needing ONLY 4 swapped layers at 256K
+    #    and 0 swapped layers at 190K!
+    plan_k8v4_256k = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
+        qwen_kv_context_tokens=262144,
+        d1_chunk_tokens=8192,
+        strip_vision_towers=True,
+        main_kv_dtype="k8v4",
+        mtp_kv_dtype="int4",
+        quantize_mtp_weights_fp8=True,
+        num_cuda_graphs=4,
+    )
+    assert plan_k8v4_256k["qwen38_main_kv_fp8_mb"] == 6144.0
+    assert plan_k8v4_256k["swapped_qwen_decoder_layers"] == 4
+
+    plan_k8v4_190k = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
+        qwen_kv_context_tokens=190000,
+        d1_chunk_tokens=8192,
+        strip_vision_towers=True,
+        main_kv_dtype="k8v4",
+        mtp_kv_dtype="int4",
+        quantize_mtp_weights_fp8=True,
+        num_cuda_graphs=4,
+    )
+    assert plan_k8v4_190k["swapped_qwen_decoder_layers"] == 0
+
     benign_block = (
         "def matrix_multiply_block(A, B):\n"
         "    # Pure mathematical block matrix multiplication in Python\n"

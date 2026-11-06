@@ -181,7 +181,14 @@ class LiquidD1DecisionEngine:
     QWEN38_MTP_MODULE_FP8_SAVINGS_MB = 355.00  # Quantizing mtp.layers.0 linear weights BF16 -> FP8
     QWEN38_VISION_TOWER_MB = 878.77
     QWEN38_AVG_LAYER_MB = 251.72
-    QWEN38_FP8_KV_BYTES_PER_TOKEN = 32768   # 16 full_attention layers * 2 * 4 kv_heads * 256 head_dim * 1B
+    QWEN38_FP8_KV_BYTES_PER_TOKEN = 32768   # K8V8: 16 full_attention layers * (1024B K_fp8 + 1024B V_fp8)
+    QWEN38_K8V4_KV_BYTES_PER_TOKEN = 24576  # K8V4 (6-bit eff.): 16 layers * (1024B K_fp8 + 512B V_int4) -> -25% VRAM!
+    # Real vLLM V1 unified pool from `qwen38-nvfp4-text` container logs (`block_size=1600`, MTP n=2, +3 padding layers):
+    # 7,650,000,000 bytes / 198,702 tokens = 38,500 bytes/token in K8V8 (FP8), or 28,875 bytes/token in K8V4 (6-bit)
+    VLLM_UNIFIED_K8V8_BYTES_PER_TOKEN = 38500
+    VLLM_UNIFIED_K8V4_BYTES_PER_TOKEN = 28875
+    VLLM_CURRENT_16_CUDAGRAPHS_MB = 563.20  # 0.55 GiB measured in vLLM log for 16 capture sizes [1..32]
+    VLLM_4_CUDAGRAPHS_MB = 140.80           # 4 capture sizes [1, 2, 4, 8] -> saves 422.40 MiB!
     QWEN38_MTP_KV_BF16_BYTES_PER_TOKEN = 4096  # mtp.layers.0.self_attn in BF16 (1,024 MiB @ 256K)
     QWEN38_MTP_KV_FP8_BYTES_PER_TOKEN = 2048   # mtp.layers.0.self_attn in FP8 (512 MiB @ 256K)
     QWEN38_MTP_KV_INT4_BYTES_PER_TOKEN = 1024  # mtp.layers.0.self_attn in 4-bit (256 MiB @ 256K)
@@ -264,17 +271,16 @@ class LiquidD1DecisionEngine:
         qwen_kv_context_tokens: int = 262144,
         d1_chunk_tokens: int = DEFAULT_SAFE_CHUNK_TOKENS,
         strip_vision_towers: bool = True,
+        main_kv_dtype: str = "fp8",  # "fp8" (K8V8 = 8-bit) | "k8v4" (K=8-bit, V=4-bit -> effective 6-bit, -25% VRAM!)
         mtp_kv_dtype: str = "int4",  # "bf16" | "fp8" | "int4"
         quantize_mtp_weights_fp8: bool = True,
         num_cuda_graphs: int = 4,
         total_vram_mb: float = RTX5090_TOTAL_VRAM_MB,
     ) -> Dict[str, Any]:
-        """Computes exact RTX 5090 VRAM budget & Qwen3.8 layer offload from real cudaMemGetInfo measurements.
+        """Computes exact RTX 5090 VRAM budget & Qwen3.8 layer offload from real cudaMemGetInfo & vLLM logs.
 
-        1. Strips useless Vision Towers from both Qwen3.8 (-878.77 MiB) and d1-3B (-824.19 MiB).
-        2. Quantizes MTP (`mtp.layers.0`) KV cache to 4-bit (256 MiB @ 256K) or FP8 (512 MiB @ 256K)
-           instead of BF16 (1,024 MiB @ 256K), plus MTP weights BF16 -> FP8 (-355 MiB).
-        3. Limits CUDA Graphs to 4 batch sizes `[1, 2, 4, 8]` (892 MiB total CUDA context + graph pool).
+        Supports asymmetric `K8V4` KV cache (`main_kv_dtype='k8v4'`, Keys in 8-bit FP8 + Values in 4-bit INT4 =
+        effective 6-bit = 24,576 B/token across 16 full-attention layers, saving 2,048 MiB at 256K context).
         """
         import math
 
@@ -285,18 +291,23 @@ class LiquidD1DecisionEngine:
         if quantize_mtp_weights_fp8:
             qwen_weights_mb -= cls.QWEN38_MTP_MODULE_FP8_SAVINGS_MB
 
+        main_kv_bpt = (
+            cls.QWEN38_K8V4_KV_BYTES_PER_TOKEN
+            if main_kv_dtype.lower() in ("k8v4", "6bit", "fp8_k_int4_v")
+            else cls.QWEN38_FP8_KV_BYTES_PER_TOKEN
+        )
         mtp_kv_bpt = {
             "bf16": cls.QWEN38_MTP_KV_BF16_BYTES_PER_TOKEN,
             "fp8": cls.QWEN38_MTP_KV_FP8_BYTES_PER_TOKEN,
             "int4": cls.QWEN38_MTP_KV_INT4_BYTES_PER_TOKEN,
         }.get(mtp_kv_dtype.lower(), cls.QWEN38_MTP_KV_INT4_BYTES_PER_TOKEN)
 
-        main_kv_mb = (qwen_kv_context_tokens * cls.QWEN38_FP8_KV_BYTES_PER_TOKEN) / (1024.0 * 1024.0)
+        main_kv_mb = (qwen_kv_context_tokens * main_kv_bpt) / (1024.0 * 1024.0)
         mtp_kv_mb = (qwen_kv_context_tokens * mtp_kv_bpt) / (1024.0 * 1024.0)
-        total_kv_bpt = cls.QWEN38_FP8_KV_BYTES_PER_TOKEN + mtp_kv_bpt
+        total_kv_bpt = main_kv_bpt + mtp_kv_bpt
 
-        # 4 CUDA Graphs [1, 2, 4, 8] = 892 MiB; extra graphs add ~45 MiB each
-        cuda_graphs_mb = cls.QWEN38_CUDA_CTX_AND_4_GRAPHS_MB + max(0, num_cuda_graphs - 4) * 45.0
+        # 4 CUDA Graphs [1, 2, 4, 8] = 892 MiB; extra graphs add ~35.2 MiB each (16 graphs = +422.4 MiB)
+        cuda_graphs_mb = cls.QWEN38_CUDA_CTX_AND_4_GRAPHS_MB + max(0, num_cuda_graphs - 4) * 35.2
         avail_for_kv_mb = (
             free_after_os_mb
             - qwen_weights_mb
@@ -322,6 +333,7 @@ class LiquidD1DecisionEngine:
             "qwen38_weights_mb": round(qwen_weights_mb, 2),
             "cuda_ctx_and_graphs_mb": round(cuda_graphs_mb, 2),
             "num_cuda_graphs": num_cuda_graphs,
+            "main_kv_dtype": main_kv_dtype,
             "mtp_kv_dtype": mtp_kv_dtype,
             "qwen38_main_kv_fp8_mb": round(main_kv_mb, 2),
             "qwen38_mtp_kv_mb": round(mtp_kv_mb, 2),
