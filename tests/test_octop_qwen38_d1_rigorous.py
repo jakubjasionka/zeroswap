@@ -208,14 +208,37 @@ def test_octop_batch_packed_zero_padding_decisions(shared_octop_plane: OctopCont
 def test_octop_long_context_overflow_sliding_window_needle_detection(
     shared_octop_plane: OctopControlPlane,
 ) -> None:
-    """Verifies Sliding-Window Super-Batch Chunking with large passes and multi-thousand-token overlap.
+    """Verifies Sliding-Window Super-Batch Chunking with 8192-token passes and VRAM offload calculation.
 
     Embeds a secret API key + PII needle inside the middle chunk of a multi-chunk context
     while the first and last chunks are 100% benign mathematical code.
     """
     assert shared_octop_plane.d1_engine.model.engine.token_budget == 262144
-    assert shared_octop_plane.d1_engine.max_chunk_tokens == 24576
-    assert shared_octop_plane.d1_engine.chunk_overlap_tokens == 4096
+    assert shared_octop_plane.d1_engine.max_chunk_tokens == 8192
+    assert shared_octop_plane.d1_engine.chunk_overlap_tokens == 1024
+
+    # Verify VRAM & layer offload calculation at 8192 chunk tokens
+    plan_128k = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
+        qwen_kv_context_tokens=131072,
+        d1_chunk_tokens=8192,
+        drop_unused_vision_towers=True,
+    )
+    assert plan_128k["min_swapped_qwen_layers_with_headroom"] == 0
+    assert plan_128k["strict_zero_extra_vram_slab_qwen_layers"] == 10
+
+    plan_192k = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
+        qwen_kv_context_tokens=196608,
+        d1_chunk_tokens=8192,
+        drop_unused_vision_towers=True,
+    )
+    assert plan_192k["min_swapped_qwen_layers_with_headroom"] == 0
+
+    plan_256k = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
+        qwen_kv_context_tokens=262144,
+        d1_chunk_tokens=8192,
+        drop_unused_vision_towers=True,
+    )
+    assert plan_256k["min_swapped_qwen_layers_with_headroom"] == 6
 
     benign_block = (
         "def matrix_multiply_block(A, B):\n"

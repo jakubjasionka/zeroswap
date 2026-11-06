@@ -136,7 +136,7 @@ class OctopControlPlane:
         self,
         d1_engine: LiquidD1DecisionEngine,
         qwen_snapshot_dir: Optional[str] = None,
-        num_swapped_qwen_layers: int = 8,
+        num_swapped_qwen_layers: int = 4,
         kv_cache_mb: int = 1024,
         device: str = "cuda:0",
     ) -> None:

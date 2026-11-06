@@ -168,9 +168,22 @@ class LiquidD1DecisionEngine:
     """Manages the real `LiquidAI/d1-3B-w8a8` INT8 W8A8 decision model for Octop API safety checks."""
 
     MAX_D1_CONTEXT_TOKENS = 32768
-    DEFAULT_SAFE_CHUNK_TOKENS = 24576
-    DEFAULT_CHUNK_OVERLAP_TOKENS = 4096
+    DEFAULT_SAFE_CHUNK_TOKENS = 8192
+    DEFAULT_CHUNK_OVERLAP_TOKENS = 1024
     DEFAULT_SUPERBATCH_TOKEN_BUDGET = 262144
+
+    # Empirical RTX 5090 (32,146.81 MiB) hardware measurements for Qwen3.8-27B-NVFP4 + LiquidAI/d1-3B-w8a8
+    RTX5090_TOTAL_VRAM_MB = 32146.81
+    QWEN38_TOTAL_CHECKPOINT_MB = 20905.90
+    QWEN38_TEXT_ONLY_MB = 20027.13
+    QWEN38_AVG_LAYER_MB = 251.72
+    QWEN38_FP8_KV_BYTES_PER_TOKEN = 32768  # 16 full_attention layers * 2 * 4 kv_heads * 256 head_dim * 1B
+    QWEN38_LINEAR_ATTN_STATE_MB = 72.0     # 48 Gated DeltaNet layers constant O(1) recurrent state
+    D1_3B_TOTAL_LOADED_MB = 3741.12
+    D1_3B_LANGUAGE_LAYERS_MB = 2326.03     # 30 INT8 W8A8 layers (77.53 MiB/layer)
+    D1_3B_VISION_TOWER_MB = 813.07
+    D1_3B_EMBEDDINGS_MB = 602.01
+    D1_3B_ACTIVATION_OVERHEAD_8K_MB = 1214.03
 
     CRITICAL_LOCAL_ONLY_MARKERS = (
         "BEGIN RSA PRIVATE KEY",
@@ -216,6 +229,61 @@ class LiquidD1DecisionEngine:
     def language_layers(self) -> nn.ModuleList:
         """Returns the 30 hybrid (`conv` + `full_attention` + `MLP`) layers of `LiquidAI/d1-3B-w8a8`."""
         return self.model.model.language_model.layers
+
+    @classmethod
+    def calculate_vram_and_layer_offload_plan(
+        cls,
+        qwen_kv_context_tokens: int = 131072,
+        d1_chunk_tokens: int = DEFAULT_SAFE_CHUNK_TOKENS,
+        drop_unused_vision_towers: bool = True,
+        total_vram_mb: float = RTX5090_TOTAL_VRAM_MB,
+        cuda_context_reserve_mb: float = 1200.0,
+    ) -> Dict[str, Any]:
+        """Computes exact VRAM budget and minimum `Qwen3.8-27B-NVFP4` layers to offload for `d1-3B-w8a8`."""
+        import math
+
+        usable_vram_mb = total_vram_mb - cuda_context_reserve_mb
+        qwen_weights_mb = cls.QWEN38_TEXT_ONLY_MB if drop_unused_vision_towers else cls.QWEN38_TOTAL_CHECKPOINT_MB
+        qwen_kv_mb = (
+            cls.QWEN38_LINEAR_ATTN_STATE_MB
+            + (qwen_kv_context_tokens * cls.QWEN38_FP8_KV_BYTES_PER_TOKEN) / (1024.0 * 1024.0)
+        )
+
+        # Transient activation overhead scales linearly ~0.1482 MiB/token on d1-3B-w8a8
+        d1_act_mb = cls.D1_3B_ACTIVATION_OVERHEAD_8K_MB * (d1_chunk_tokens / 8192.0)
+        d1_weights_mb = (
+            (cls.D1_3B_TOTAL_LOADED_MB - cls.D1_3B_VISION_TOWER_MB)
+            if drop_unused_vision_towers
+            else cls.D1_3B_TOTAL_LOADED_MB
+        )
+        d1_peak_total_mb = d1_weights_mb + d1_act_mb
+
+        # Mode A: Strict Zero-Extra-VRAM Slab (only overwriting d1-3B's 30 language layers = 2,326.03 MiB)
+        strict_slab_layers = math.ceil(cls.D1_3B_LANGUAGE_LAYERS_MB / cls.QWEN38_AVG_LAYER_MB)  # 10 layers
+
+        # Mode B: Free-VRAM-Assisted Offload (use remaining RTX 5090 VRAM headroom first, swap only deficit)
+        free_vram_before_swap_mb = usable_vram_mb - qwen_weights_mb - qwen_kv_mb
+        vram_deficit_mb = max(0.0, d1_peak_total_mb - free_vram_before_swap_mb)
+        min_offload_layers = math.ceil(vram_deficit_mb / cls.QWEN38_AVG_LAYER_MB)
+
+        return {
+            "total_vram_mb": round(total_vram_mb, 2),
+            "usable_vram_mb": round(usable_vram_mb, 2),
+            "qwen38_weights_mb": round(qwen_weights_mb, 2),
+            "qwen38_kv_context_tokens": qwen_kv_context_tokens,
+            "qwen38_kv_cache_fp8_mb": round(qwen_kv_mb, 2),
+            "free_vram_before_swap_mb": round(free_vram_before_swap_mb, 2),
+            "d1_chunk_tokens": d1_chunk_tokens,
+            "d1_weights_mb": round(d1_weights_mb, 2),
+            "d1_language_layers_only_mb": round(cls.D1_3B_LANGUAGE_LAYERS_MB, 2),
+            "d1_transient_activations_mb": round(d1_act_mb, 2),
+            "d1_peak_total_mb": round(d1_peak_total_mb, 2),
+            "vram_deficit_mb": round(vram_deficit_mb, 2),
+            "min_swapped_qwen_layers_with_headroom": min_offload_layers,
+            "strict_zero_extra_vram_slab_qwen_layers": strict_slab_layers,
+            "pcie_restore_mb_min": round(min_offload_layers * cls.QWEN38_AVG_LAYER_MB, 2),
+            "pcie_restore_mb_strict_slab": round(strict_slab_layers * cls.QWEN38_AVG_LAYER_MB, 2),
+        }
 
     def split_into_overlapping_token_chunks(
         self,
