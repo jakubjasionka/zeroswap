@@ -172,13 +172,17 @@ class LiquidD1DecisionEngine:
     DEFAULT_CHUNK_OVERLAP_TOKENS = 1024
     DEFAULT_SUPERBATCH_TOKEN_BUDGET = 262144
 
-    # Empirical RTX 5090 (32,146.81 MiB) hardware measurements for Qwen3.8-27B-NVFP4 + LiquidAI/d1-3B-w8a8
+    # Empirical RTX 5090 (32,146.81 MiB / 31.39 GiB) hardware measurements for Qwen3.8-27B-NVFP4 + MTP + d1-3B-w8a8
     RTX5090_TOTAL_VRAM_MB = 32146.81
-    QWEN38_TOTAL_CHECKPOINT_MB = 20905.90
+    QWEN38_TOTAL_CHECKPOINT_MB = 20905.90  # 16,110.04 MiB (64 layers) + 3,107.04 MiB (embed/head) + 878.77 MiB (visual) + 810.05 MiB (MTP BF16)
+    QWEN38_MTP_MODULE_BF16_MB = 810.05     # mtp.fc + mtp.layers.0 (unquantized BF16 = 3.22x a normal layer!)
+    QWEN38_VISION_TOWER_MB = 878.77
     QWEN38_TEXT_ONLY_MB = 20027.13
     QWEN38_AVG_LAYER_MB = 251.72
     QWEN38_FP8_KV_BYTES_PER_TOKEN = 32768  # 16 full_attention layers * 2 * 4 kv_heads * 256 head_dim * 1B
-    QWEN38_LINEAR_ATTN_STATE_MB = 72.0     # 48 Gated DeltaNet layers constant O(1) recurrent state
+    QWEN38_MTP_KV_BYTES_PER_TOKEN = 4096   # mtp.layers.0.self_attn (1 layer * 2 * 4 kv_heads * 256 head_dim * 2B BF16)
+    QWEN38_LINEAR_ATTN_STATE_MB = 240.0    # 48 Gated DeltaNet recurrent + conv states + MTP speculative buffers
+    QWEN38_VLLM_RUNTIME_GRAPHS_MB = 1024.0 # vLLM CUDA graphs + sampler logits [B, 248320] + workspace
     D1_3B_TOTAL_LOADED_MB = 3741.12
     D1_3B_LANGUAGE_LAYERS_MB = 2326.03     # 30 INT8 W8A8 layers (77.53 MiB/layer)
     D1_3B_VISION_TOWER_MB = 813.07
@@ -233,56 +237,75 @@ class LiquidD1DecisionEngine:
     @classmethod
     def calculate_vram_and_layer_offload_plan(
         cls,
-        qwen_kv_context_tokens: int = 131072,
+        qwen_kv_context_tokens: int = 262144,
         d1_chunk_tokens: int = DEFAULT_SAFE_CHUNK_TOKENS,
-        drop_unused_vision_towers: bool = True,
+        include_mtp_and_vllm_runtime: bool = True,
+        drop_d1_vision_tower: bool = True,
         total_vram_mb: float = RTX5090_TOTAL_VRAM_MB,
-        cuda_context_reserve_mb: float = 1200.0,
     ) -> Dict[str, Any]:
-        """Computes exact VRAM budget and minimum `Qwen3.8-27B-NVFP4` layers to offload for `d1-3B-w8a8`."""
+        """Computes exact VRAM budget and minimum `Qwen3.8-27B-NVFP4` layers to offload on RTX 5090.
+
+        Accounts for the full ~30.15 GiB (`30,874 MiB`) footprint of `Qwen3.8-27B-NVFP4` at 256K context
+        with MTP (`mtp.layers.0` unquantized BF16 = 810.05 MiB + 1,024 MiB MTP KV cache + 8,192 MiB FP8 KV
+        + 1,024 MiB vLLM CUDA graphs/workspace).
+        """
         import math
 
-        usable_vram_mb = total_vram_mb - cuda_context_reserve_mb
-        qwen_weights_mb = cls.QWEN38_TEXT_ONLY_MB if drop_unused_vision_towers else cls.QWEN38_TOTAL_CHECKPOINT_MB
-        qwen_kv_mb = (
-            cls.QWEN38_LINEAR_ATTN_STATE_MB
-            + (qwen_kv_context_tokens * cls.QWEN38_FP8_KV_BYTES_PER_TOKEN) / (1024.0 * 1024.0)
+        qwen_weights_mb = cls.QWEN38_TOTAL_CHECKPOINT_MB
+        main_kv_mb = (qwen_kv_context_tokens * cls.QWEN38_FP8_KV_BYTES_PER_TOKEN) / (1024.0 * 1024.0)
+        mtp_kv_mb = (
+            (qwen_kv_context_tokens * cls.QWEN38_MTP_KV_BYTES_PER_TOKEN) / (1024.0 * 1024.0)
+            if include_mtp_and_vllm_runtime
+            else 0.0
+        )
+        runtime_mb = cls.QWEN38_VLLM_RUNTIME_GRAPHS_MB if include_mtp_and_vllm_runtime else 512.0
+        qwen_total_footprint_mb = (
+            qwen_weights_mb + main_kv_mb + mtp_kv_mb + cls.QWEN38_LINEAR_ATTN_STATE_MB + runtime_mb
         )
 
         # Transient activation overhead scales linearly ~0.1482 MiB/token on d1-3B-w8a8
         d1_act_mb = cls.D1_3B_ACTIVATION_OVERHEAD_8K_MB * (d1_chunk_tokens / 8192.0)
         d1_weights_mb = (
             (cls.D1_3B_TOTAL_LOADED_MB - cls.D1_3B_VISION_TOWER_MB)
-            if drop_unused_vision_towers
+            if drop_d1_vision_tower
             else cls.D1_3B_TOTAL_LOADED_MB
         )
         d1_peak_total_mb = d1_weights_mb + d1_act_mb
 
-        # Mode A: Strict Zero-Extra-VRAM Slab (only overwriting d1-3B's 30 language layers = 2,326.03 MiB)
-        strict_slab_layers = math.ceil(cls.D1_3B_LANGUAGE_LAYERS_MB / cls.QWEN38_AVG_LAYER_MB)  # 10 layers
-
-        # Mode B: Free-VRAM-Assisted Offload (use remaining RTX 5090 VRAM headroom first, swap only deficit)
-        free_vram_before_swap_mb = usable_vram_mb - qwen_weights_mb - qwen_kv_mb
+        free_vram_before_swap_mb = max(0.0, total_vram_mb - qwen_total_footprint_mb)
         vram_deficit_mb = max(0.0, d1_peak_total_mb - free_vram_before_swap_mb)
-        min_offload_layers = math.ceil(vram_deficit_mb / cls.QWEN38_AVG_LAYER_MB)
+
+        # Option 1: Swap only Qwen decoder layers (251.72 MiB/layer)
+        decoder_only_layers = math.ceil(vram_deficit_mb / cls.QWEN38_AVG_LAYER_MB)
+
+        # Option 2: Swap Qwen's non-prefill MTP (810.05 MiB) + Vision (878.77 MiB) = 1,688.82 MiB first,
+        # then only the remaining deficit from Qwen decoder layers!
+        deficit_after_mtp_visual_mb = max(
+            0.0, vram_deficit_mb - (cls.QWEN38_MTP_MODULE_BF16_MB + cls.QWEN38_VISION_TOWER_MB)
+        )
+        decoder_layers_with_mtp_visual_swap = math.ceil(
+            deficit_after_mtp_visual_mb / cls.QWEN38_AVG_LAYER_MB
+        )
 
         return {
             "total_vram_mb": round(total_vram_mb, 2),
-            "usable_vram_mb": round(usable_vram_mb, 2),
-            "qwen38_weights_mb": round(qwen_weights_mb, 2),
-            "qwen38_kv_context_tokens": qwen_kv_context_tokens,
-            "qwen38_kv_cache_fp8_mb": round(qwen_kv_mb, 2),
+            "qwen38_weights_with_mtp_mb": round(qwen_weights_mb, 2),
+            "qwen38_main_kv_fp8_mb": round(main_kv_mb, 2),
+            "qwen38_mtp_kv_bf16_mb": round(mtp_kv_mb, 2),
+            "qwen38_total_runtime_footprint_mb": round(qwen_total_footprint_mb, 2),
+            "qwen38_total_runtime_footprint_gib": round(qwen_total_footprint_mb / 1024.0, 2),
             "free_vram_before_swap_mb": round(free_vram_before_swap_mb, 2),
             "d1_chunk_tokens": d1_chunk_tokens,
             "d1_weights_mb": round(d1_weights_mb, 2),
-            "d1_language_layers_only_mb": round(cls.D1_3B_LANGUAGE_LAYERS_MB, 2),
             "d1_transient_activations_mb": round(d1_act_mb, 2),
             "d1_peak_total_mb": round(d1_peak_total_mb, 2),
             "vram_deficit_mb": round(vram_deficit_mb, 2),
-            "min_swapped_qwen_layers_with_headroom": min_offload_layers,
-            "strict_zero_extra_vram_slab_qwen_layers": strict_slab_layers,
-            "pcie_restore_mb_min": round(min_offload_layers * cls.QWEN38_AVG_LAYER_MB, 2),
-            "pcie_restore_mb_strict_slab": round(strict_slab_layers * cls.QWEN38_AVG_LAYER_MB, 2),
+            "swapped_qwen_decoder_layers_only": decoder_only_layers,
+            "swapped_qwen_decoder_layers_with_mtp_and_visual_offload": decoder_layers_with_mtp_visual_swap,
+            "pcie_restore_decoder_only_mb": round(decoder_only_layers * cls.QWEN38_AVG_LAYER_MB, 2),
+            "pcie_restore_with_mtp_visual_mb": round(
+                decoder_layers_with_mtp_visual_swap * cls.QWEN38_AVG_LAYER_MB, 2
+            ),
         }
 
     def split_into_overlapping_token_chunks(

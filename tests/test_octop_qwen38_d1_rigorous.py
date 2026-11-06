@@ -217,28 +217,25 @@ def test_octop_long_context_overflow_sliding_window_needle_detection(
     assert shared_octop_plane.d1_engine.max_chunk_tokens == 8192
     assert shared_octop_plane.d1_engine.chunk_overlap_tokens == 1024
 
-    # Verify VRAM & layer offload calculation at 8192 chunk tokens
-    plan_128k = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
-        qwen_kv_context_tokens=131072,
-        d1_chunk_tokens=8192,
-        drop_unused_vision_towers=True,
+    # Verify full ~30.65 GiB (256K context + MTP BF16 + vLLM graphs) VRAM & layer offload calculation
+    plan_24k = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
+        qwen_kv_context_tokens=262144,
+        d1_chunk_tokens=24576,
+        include_mtp_and_vllm_runtime=True,
+        drop_d1_vision_tower=True,
     )
-    assert plan_128k["min_swapped_qwen_layers_with_headroom"] == 0
-    assert plan_128k["strict_zero_extra_vram_slab_qwen_layers"] == 10
+    assert plan_24k["qwen38_total_runtime_footprint_gib"] == 30.65
+    assert plan_24k["swapped_qwen_decoder_layers_only"] == 24
 
-    plan_192k = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
-        qwen_kv_context_tokens=196608,
-        d1_chunk_tokens=8192,
-        drop_unused_vision_towers=True,
-    )
-    assert plan_192k["min_swapped_qwen_layers_with_headroom"] == 0
-
-    plan_256k = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
+    plan_8k = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
         qwen_kv_context_tokens=262144,
         d1_chunk_tokens=8192,
-        drop_unused_vision_towers=True,
+        include_mtp_and_vllm_runtime=True,
+        drop_d1_vision_tower=True,
     )
-    assert plan_256k["min_swapped_qwen_layers_with_headroom"] == 6
+    assert plan_8k["qwen38_total_runtime_footprint_gib"] == 30.65
+    assert plan_8k["swapped_qwen_decoder_layers_only"] == 14
+    assert plan_8k["swapped_qwen_decoder_layers_with_mtp_and_visual_offload"] == 7
 
     benign_block = (
         "def matrix_multiply_block(A, B):\n"
