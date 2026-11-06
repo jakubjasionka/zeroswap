@@ -5,6 +5,7 @@ from zeroswap.engine.static_slab import KVCacheInvariantError, StaticSlab
 from zeroswap.engine.pinned_host import PinnedHostPool
 from zeroswap.engine.pcie_streamer import PCIeStreamer
 from zeroswap.engine.layer_interceptor import LayerInterceptor
+from zeroswap.engine.tensor_core_pipeline import TensorCoreMetrics, TensorCorePipelineEngine
 from zeroswap.optimizer.profiler import AutoProfiler
 from zeroswap.optimizer.kv_budget import KVBudgetPlanner
 from zeroswap.optimizer.router import RuntimeDecisionRouter
@@ -29,6 +30,8 @@ __all__ = [
     "PinnedHostPool",
     "PCIeStreamer",
     "LayerInterceptor",
+    "TensorCorePipelineEngine",
+    "TensorCoreMetrics",
     "AutoProfiler",
     "KVBudgetPlanner",
     "RuntimeDecisionRouter",

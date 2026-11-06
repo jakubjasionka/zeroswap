@@ -1,8 +1,10 @@
 /*
  * zeroswap_cuda_ext.cu
- * Low-level C++/CUDA bindings for asynchronous HtoD weight streaming (`cudaMemcpyAsync`),
- * batched layer-wise in-place weight overwrite, and cross-stream event synchronization
- * (`cudaEventRecord` + `cudaStreamWaitEvent`) without invalidating CUDA Graph virtual tensor pointers.
+ * Low-level C++/CUDA bindings for:
+ * 1. Asynchronous HtoD weight streaming (`cudaMemcpyAsync`)
+ * 2. Batched layer-wise in-place weight overwrite (`async_batch_inplace_h2d_overwrite`)
+ * 3. Pre-allocated zero-allocation 256-slot `cudaEvent_t` barrier pool (`record_slot_event`,
+ *    `wait_slot_event`) for lock-free fine-grained per-layer Tensor Core pipelining.
  */
 
 #include <torch/extension.h>
@@ -10,6 +12,27 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <vector>
 #include <algorithm>
+#include <mutex>
+
+namespace {
+constexpr int kMaxEventSlots = 256;
+cudaEvent_t g_event_pool[kMaxEventSlots];
+bool g_pool_initialized = false;
+std::mutex g_pool_mutex;
+
+void ensure_event_pool_initialized() {
+    if (!g_pool_initialized) {
+        std::lock_guard<std::mutex> lock(g_pool_mutex);
+        if (!g_pool_initialized) {
+            for (int i = 0; i < kMaxEventSlots; ++i) {
+                cudaError_t err = cudaEventCreateWithFlags(&g_event_pool[i], cudaEventDisableTiming);
+                TORCH_CHECK(err == cudaSuccess, "cudaEventCreateWithFlags failed: ", cudaGetErrorString(err));
+            }
+            g_pool_initialized = true;
+        }
+    }
+}
+} // namespace
 
 void async_inplace_h2d_overwrite(
     torch::Tensor dst_gpu,
@@ -75,6 +98,22 @@ int64_t async_batch_inplace_h2d_overwrite(
     return static_cast<int64_t>(total_bytes);
 }
 
+void record_slot_event(int slot_id, int64_t stream_handle) {
+    ensure_event_pool_initialized();
+    TORCH_CHECK(slot_id >= 0 && slot_id < kMaxEventSlots, "slot_id out of range [0, 255]");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    cudaError_t err = cudaEventRecord(g_event_pool[slot_id], stream);
+    TORCH_CHECK(err == cudaSuccess, "cudaEventRecord failed: ", cudaGetErrorString(err));
+}
+
+void wait_slot_event(int slot_id, int64_t stream_handle) {
+    ensure_event_pool_initialized();
+    TORCH_CHECK(slot_id >= 0 && slot_id < kMaxEventSlots, "slot_id out of range [0, 255]");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    cudaError_t err = cudaStreamWaitEvent(stream, g_event_pool[slot_id], 0);
+    TORCH_CHECK(err == cudaSuccess, "cudaStreamWaitEvent failed: ", cudaGetErrorString(err));
+}
+
 int64_t create_stream_barrier_event(int64_t copy_stream_handle) {
     cudaStream_t copy_stream = reinterpret_cast<cudaStream_t>(copy_stream_handle);
     cudaEvent_t ev;
@@ -104,6 +143,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "async_batch_inplace_h2d_overwrite",
         &async_batch_inplace_h2d_overwrite,
         "Batched zero-copy asynchronous Host-to-Device in-place weight overwrite for a full transformer layer"
+    );
+    m.def(
+        "record_slot_event",
+        &record_slot_event,
+        "Records a pre-allocated lock-free CUDA event in slot [0..255] on the given CUDA stream"
+    );
+    m.def(
+        "wait_slot_event",
+        &wait_slot_event,
+        "Waits on a pre-allocated lock-free CUDA event in slot [0..255] from the given CUDA stream"
     );
     m.def(
         "create_stream_barrier_event",

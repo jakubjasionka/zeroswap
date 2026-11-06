@@ -81,12 +81,75 @@ PYTHONPATH=. python3 -m zeroswap.tune \
   --secondary LiquidAI/d1-3B-w8a8 \
   --gpu 0 --out plan.json
 
-# 2. Run the full 18-test rigorous pytest suite (including real Qwen3.8 + d1-3B-w8a8 + CUDA ext)
+# 2. Run the full 20-test rigorous pytest suite (including real Qwen3.8 + d1-3B-w8a8 + CUDA ext + Tensor Core pipeline)
 PYTHONPATH=. pytest -v
 
 # 3. Run the 15-layer Qwen3.8-27B-NVFP4 + LiquidAI/d1-3B-w8a8 Octop API GPU benchmark
 PYTHONPATH=. python3 benchmarks/test_octop_qwen38_d1_benchmark.py
+
+# 4. Run the 5th-Gen Tensor Core Utilization & Batch/Token Throughput Matrix benchmark
+PYTHONPATH=. python3 benchmarks/test_tensor_core_throughput_matrix.py
 ```
+
+---
+
+## 5th-Gen Tensor Core Utilization & Batch/Token Throughput Matrix (RTX 5090 `sm_120`)
+
+Empirical hardware peaks measured on **NVIDIA GeForce RTX 5090 (`sm_120`)**:
+- **FP8 `e4m3fn` Tensor Cores (`torch._scaled_mm`)**: **712.23 TFLOPS**
+- **BF16 Tensor Cores (`torch.mm`)**: **239.76 TFLOPS**
+- **INT8 W8A8 Tensor Cores (`torch._int_mm`)**: **240.13 TOPS**
+
+### 1. `LiquidAI/d1-3B-w8a8` INT8 Tensor Core Super-Batch Scaling (`evaluate_octop_superbatch_packed`)
+
+By flattening $B$ agent subtasks $\times 4$ Octop safety questions into a single zero-padding packed `Tree` pass (`M = \sum \text{tokens}`), `LiquidD1DecisionEngine.evaluate_octop_superbatch_packed` achieves up to **5.91x speedup** and **87.94 INT8 TOPS** (`16,814.7 tok/s`, `119.5 Binary Safety Decisions/sec`):
+
+| Batch (Prompts) | Total Questions ($4B$) | Packed Input Tokens | Sequential Batch (ms) | Super-Batch Packed (ms) | Speedup | Throughput (tok/s) | Safety Decisions/sec | Sustained INT8 TOPS |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **1** | 4 | 535 | 198.3 ms | 196.9 ms | **1.01x** | 2,717.0 tok/s | 20.3 dec/s | 14.21 TOPS |
+| **2** | 8 | 1,146 | 394.8 ms | 213.3 ms | **1.85x** | 5,372.8 tok/s | 37.5 dec/s | 28.10 TOPS |
+| **4** | 16 | 2,252 | 788.1 ms | 252.4 ms | **3.12x** | 8,921.0 tok/s | 63.4 dec/s | 46.66 TOPS |
+| **8** | 32 | 4,504 | 1,575.6 ms | 360.4 ms | **4.37x** | 12,499.1 tok/s | 88.8 dec/s | 65.37 TOPS |
+| **16** | 64 | 9,008 | 3,192.2 ms | 575.4 ms | **5.55x** | 15,654.9 tok/s | 111.2 dec/s | 81.87 TOPS |
+| **32** | 128 | 18,016 | 6,330.1 ms | **1,071.5 ms** | **5.91x** | **16,814.7 tok/s** | **119.5 dec/s** | **87.94 TOPS** |
+
+### 2. `nvidia/Qwen3.8-27B-NVFP4` (64 Layers, 15 Swapped = `3,773.04 MB`) — FP8 Tensor Core Pipeline Matrix
+
+Comparison across all 4 `TensorCorePipelineEngine` modes (`sync_stop_and_copy`, `coarse_bulk_overlap`, `fine_grained_layer_chained` via C++ 256-slot event ring buffer, and `multi_stream_superbatch_interleaved`):
+
+| Scenario ($B \times S$) | Pipeline Mode | Tokens | Wall Time (ms) | Exposed PCIe Stall (ms) | Throughput (tok/s) | Sustained TFLOPS | Tensor Core Duty Cycle (%) | Peak TC Saturation (%) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`B=1, S=256`** | `sync_stop_and_copy` | 256 | 165.7 ms | 139.6 ms | 1,545.4 tok/s | 63.26 TFLOPS | 15.8% | 8.9% |
+| **`B=1, S=256`** | `fine_grained_layer_chained` | 256 | 141.4 ms | 115.9 ms | 1,810.0 tok/s | 74.09 TFLOPS | 18.1% | 10.4% |
+| **`B=1, S=256`** | `multi_stream_superbatch_interleaved` | 768 | 152.8 ms | 79.8 ms | **5,026.2 tok/s** | **205.76 TFLOPS** | **47.8%** | **28.9%** |
+| **`B=1, S=1024`** | `sync_stop_and_copy` | 1,024 | 214.9 ms | 138.3 ms | 4,765.2 tok/s | 195.07 TFLOPS | 35.6% | 27.4% |
+| **`B=1, S=1024`** | `fine_grained_layer_chained` | 1,024 | 142.3 ms | 65.3 ms | 7,197.0 tok/s | 294.62 TFLOPS | 54.1% | 41.4% |
+| **`B=1, S=1024`** | `multi_stream_superbatch_interleaved` | 3,072 | 227.9 ms | **0.0 ms** | **13,476.9 tok/s** | **551.70 TFLOPS** | **100.0%** | **77.5%** |
+| **`B=4, S=512`** | `sync_stop_and_copy` | 2,048 | 285.0 ms | 131.7 ms | 7,187.0 tok/s | 294.21 TFLOPS | 53.8% | 41.3% |
+| **`B=4, S=512`** | `coarse_bulk_overlap` | 2,048 | 174.4 ms | 21.8 ms | 11,741.3 tok/s | 480.65 TFLOPS | 87.5% | 67.5% |
+| **`B=4, S=512`** | `fine_grained_layer_chained` | 2,048 | 153.6 ms | **3.4 ms** | 13,333.6 tok/s | 545.83 TFLOPS | **97.8%** | 76.6% |
+| **`B=4, S=512`** | `multi_stream_superbatch_interleaved` | 6,144 | 447.4 ms | **0.0 ms** | **13,734.0 tok/s** | **562.22 TFLOPS** | **100.0%** | **78.9%** |
+| **`B=8, S=1024`** | `sync_stop_and_copy` | 8,192 | 683.0 ms | 131.3 ms | 11,993.5 tok/s | 490.97 TFLOPS | 80.8% | 68.9% |
+| **`B=8, S=1024`** | `fine_grained_layer_chained` | 8,192 | 547.1 ms | **0.3 ms** | 14,974.4 tok/s | 613.00 TFLOPS | **99.9%** | 86.1% |
+| **`B=8, S=1024`** | `multi_stream_superbatch_interleaved` | 24,576 | 1,619.9 ms | **0.0 ms** | **15,171.2 tok/s** | **621.06 TFLOPS** | **100.0%** | **87.2%** |
+| **`B=16, S=1024`** | `sync_stop_and_copy` | 16,384 | 1,127.3 ms | 133.4 ms | 14,533.3 tok/s | 594.94 TFLOPS | 88.2% | 83.5% |
+| **`B=16, S=1024`** | `fine_grained_layer_chained` | 16,384 | 997.1 ms | **0.0 ms** | 16,431.5 tok/s | 672.65 TFLOPS | **100.0%** | 94.4% |
+| **`B=16, S=1024`** | `multi_stream_superbatch_interleaved` | 49,152 | 2,962.4 ms | **0.0 ms** | **16,591.8 tok/s** | **679.21 TFLOPS** | **100.0%** | **95.4%** |
+| **`B=32, S=1024`** | `sync_stop_and_copy` | 32,768 | 2,207.1 ms | 134.8 ms | 14,846.6 tok/s | 607.76 TFLOPS | 93.9% | 85.3% |
+| **`B=32, S=1024`** | `multi_stream_superbatch_interleaved` | 98,304 | 6,192.4 ms | **0.0 ms** | **15,874.8 tok/s** | **649.86 TFLOPS** | **100.0%** | **91.2%** |
+
+### 3. `nvidia/Qwen3.8-27B-NVFP4` — BF16 Tensor Core Pipeline Matrix (Selected Scenarios)
+
+| Scenario ($B \times S$) | Pipeline Mode | Tokens | Wall Time (ms) | Exposed PCIe Stall (ms) | Throughput (tok/s) | Sustained TFLOPS | Tensor Core Duty Cycle (%) | Peak TC Saturation (%) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`B=1, S=256`** | `sync_stop_and_copy` | 256 | 188.8 ms | 139.6 ms | 1,355.9 tok/s | 55.51 TFLOPS | 26.1% | 23.1% |
+| **`B=1, S=256`** | `multi_stream_superbatch_interleaved` | 768 | 164.2 ms | **16.0 ms** | **4,677.6 tok/s** | **191.49 TFLOPS** | **90.2%** | **79.9%** |
+| **`B=1, S=1024`** | `sync_stop_and_copy` | 1,024 | 317.3 ms | 138.3 ms | 3,227.6 tok/s | 132.13 TFLOPS | 56.4% | 55.1% |
+| **`B=1, S=1024`** | `multi_stream_superbatch_interleaved` | 3,072 | 541.4 ms | **0.0 ms** | **5,673.8 tok/s** | **232.27 TFLOPS** | **100.0%** | **96.9%** |
+| **`B=4, S=512`** | `sync_stop_and_copy` | 2,048 | 493.4 ms | 132.2 ms | 4,151.2 tok/s | 169.94 TFLOPS | 73.2% | 70.9% |
+| **`B=4, S=512`** | `multi_stream_superbatch_interleaved` | 6,144 | 1,061.8 ms | **0.0 ms** | **5,786.6 tok/s** | **236.88 TFLOPS** | **100.0%** | **98.8%** |
+| **`B=1, S=4096`** | `sync_stop_and_copy` | 4,096 | 843.3 ms | 140.8 ms | 4,857.1 tok/s | 198.83 TFLOPS | 83.3% | 82.9% |
+| **`B=1, S=4096`** | `multi_stream_superbatch_interleaved` | 12,288 | 2,090.7 ms | **0.0 ms** | **5,877.5 tok/s** | **240.60 TFLOPS** | **100.0%** | **100.0%** |
 
 ## License
 

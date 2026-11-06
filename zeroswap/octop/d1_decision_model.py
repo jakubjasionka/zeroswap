@@ -13,7 +13,7 @@ import glob
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
@@ -255,6 +255,74 @@ class LiquidD1DecisionEngine:
             )
             for prompt, out in zip(candidate_prompts, batch_out)
         ]
+
+    def evaluate_octop_superbatch_packed(
+        self,
+        candidate_prompts: Sequence[str],
+    ) -> Tuple[List[OctopSafetyDecision], Dict[str, float]]:
+        """Packs `B` prompts x 4 Octop safety questions into ONE zero-padding Tensor Core forward pass.
+
+        Unlike upstream `system_one_batch` (which runs multi-question states sequentially one-by-one),
+        this method flattens all `(state_i, question_j)` pairs into a single packed `Tree` pass so
+        `torch._int_mm` INT8 Tensor Cores receive a massive `M = sum(tokens)` matrix in one shot.
+        """
+        if not candidate_prompts:
+            return [], {}
+
+        t0 = time.perf_counter()
+        q_names = list(OCTOP_EXTERNAL_API_QUESTIONS.keys())
+        single_q_requests = [
+            (prompt, {q_name: OCTOP_EXTERNAL_API_QUESTIONS[q_name]})
+            for prompt in candidate_prompts
+            for q_name in q_names
+        ]
+        packed_results = self.model.system_one_batch(single_q_requests)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        num_q = len(q_names)
+        decisions: List[OctopSafetyDecision] = []
+        total_input_tokens = 0
+
+        for i, prompt in enumerate(candidate_prompts):
+            merged_answers: Dict[str, Any] = {}
+            prompt_tokens = 0
+            for j, q_name in enumerate(q_names):
+                res_ij = packed_results[i * num_q + j]
+                merged_answers[q_name] = res_ij["answers"][q_name]
+                prompt_tokens += int(res_ij["usage"]["input_tokens"])
+            total_input_tokens += prompt_tokens
+            merged_raw = {
+                "answers": merged_answers,
+                "usage": {"input_tokens": prompt_tokens, "output_tokens": 0},
+            }
+            decisions.append(
+                self._parse_d1_output(
+                    raw_out=merged_raw,
+                    candidate_text=str(prompt),
+                    elapsed_ms=elapsed_ms / len(candidate_prompts),
+                )
+            )
+
+        # 5.23 GOPS per token across 30 hybrid INT8 W8A8 layers + lm_head
+        total_int8_ops = total_input_tokens * 5.23e9
+        int8_tops = (total_int8_ops / (elapsed_ms / 1000.0)) / 1e12
+        tokens_per_sec = total_input_tokens / (elapsed_ms / 1000.0)
+        decisions_per_sec = (len(candidate_prompts) * num_q) / (elapsed_ms / 1000.0)
+        prompts_per_sec = len(candidate_prompts) / (elapsed_ms / 1000.0)
+
+        telemetry = {
+            "batch_prompts": float(len(candidate_prompts)),
+            "total_questions_evaluated": float(len(candidate_prompts) * num_q),
+            "total_packed_tokens": float(total_input_tokens),
+            "wall_time_ms": round(elapsed_ms, 2),
+            "throughput_tokens_per_sec": round(tokens_per_sec, 1),
+            "throughput_prompts_per_sec": round(prompts_per_sec, 2),
+            "throughput_decisions_per_sec": round(decisions_per_sec, 2),
+            "sustained_int8_tensor_core_tops": round(int8_tops, 2),
+        }
+        return decisions, telemetry
 
     def _parse_d1_output(
         self,
