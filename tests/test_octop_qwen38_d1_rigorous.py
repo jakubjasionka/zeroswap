@@ -216,26 +216,43 @@ def test_octop_long_context_overflow_sliding_window_needle_detection(
     assert shared_octop_plane.d1_engine.model.engine.token_budget == 262144
     assert shared_octop_plane.d1_engine.max_chunk_tokens == 8192
     assert shared_octop_plane.d1_engine.chunk_overlap_tokens == 1024
+    assert shared_octop_plane.d1_engine.model.model.vision_tower is None
+    assert len(shared_octop_plane.cuda_graph_batch_sizes) == 4
 
-    # Verify full ~30.65 GiB (256K context + MTP BF16 + vLLM graphs) VRAM & layer offload calculation
-    plan_24k = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
-        qwen_kv_context_tokens=262144,
-        d1_chunk_tokens=24576,
-        include_mtp_and_vllm_runtime=True,
-        drop_d1_vision_tower=True,
-    )
-    assert plan_24k["qwen38_total_runtime_footprint_gib"] == 30.65
-    assert plan_24k["swapped_qwen_decoder_layers_only"] == 24
-
-    plan_8k = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
+    # 1. Default unoptimized (Vision kept, BF16 MTP KV, BF16 MTP weights) -> CANNOT fit 256K context (OOM!)
+    plan_default_bf16 = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
         qwen_kv_context_tokens=262144,
         d1_chunk_tokens=8192,
-        include_mtp_and_vllm_runtime=True,
-        drop_d1_vision_tower=True,
+        strip_vision_towers=False,
+        mtp_kv_dtype="bf16",
+        quantize_mtp_weights_fp8=False,
+        num_cuda_graphs=4,
     )
-    assert plan_8k["qwen38_total_runtime_footprint_gib"] == 30.65
-    assert plan_8k["swapped_qwen_decoder_layers_only"] == 14
-    assert plan_8k["swapped_qwen_decoder_layers_with_mtp_and_visual_offload"] == 7
+    assert plan_default_bf16["fits_target_context_without_oom"] is False
+    assert plan_default_bf16["max_possible_context_tokens"] < 240000
+
+    # 2. Optimized (Vision stripped, 4 CUDA Graphs, 4-bit MTP KV, FP8 MTP weights) -> fits up to 295.7K!
+    plan_opt_256k = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
+        qwen_kv_context_tokens=262144,
+        d1_chunk_tokens=8192,
+        strip_vision_towers=True,
+        mtp_kv_dtype="int4",
+        quantize_mtp_weights_fp8=True,
+        num_cuda_graphs=4,
+    )
+    assert plan_opt_256k["fits_target_context_without_oom"] is True
+    assert plan_opt_256k["max_possible_context_tokens"] > 290000
+    assert plan_opt_256k["swapped_qwen_decoder_layers"] == 13
+
+    plan_opt_192k = LiquidD1DecisionEngine.calculate_vram_and_layer_offload_plan(
+        qwen_kv_context_tokens=196608,
+        d1_chunk_tokens=8192,
+        strip_vision_towers=True,
+        mtp_kv_dtype="int4",
+        quantize_mtp_weights_fp8=True,
+        num_cuda_graphs=4,
+    )
+    assert plan_opt_192k["swapped_qwen_decoder_layers"] == 4
 
     benign_block = (
         "def matrix_multiply_block(A, B):\n"

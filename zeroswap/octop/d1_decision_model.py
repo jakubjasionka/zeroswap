@@ -172,19 +172,24 @@ class LiquidD1DecisionEngine:
     DEFAULT_CHUNK_OVERLAP_TOKENS = 1024
     DEFAULT_SUPERBATCH_TOKEN_BUDGET = 262144
 
-    # Empirical RTX 5090 (32,146.81 MiB / 31.39 GiB) hardware measurements for Qwen3.8-27B-NVFP4 + MTP + d1-3B-w8a8
+    # Empirical RTX 5090 (32,146.81 MiB / 31.39 GiB) hardware measurements via cudaMemGetInfo(0)
     RTX5090_TOTAL_VRAM_MB = 32146.81
-    QWEN38_TOTAL_CHECKPOINT_MB = 20905.90  # 16,110.04 MiB (64 layers) + 3,107.04 MiB (embed/head) + 878.77 MiB (visual) + 810.05 MiB (MTP BF16)
-    QWEN38_MTP_MODULE_BF16_MB = 810.05     # mtp.fc + mtp.layers.0 (unquantized BF16 = 3.22x a normal layer!)
+    RTX5090_OS_DRIVER_RESERVED_MB = 849.06  # Measured via cudaMemGetInfo(0): 31,297.75 MiB free at startup
+    QWEN38_TOTAL_CHECKPOINT_MB = 20905.90   # With Vision Tower (878.77 MiB) + BF16 MTP (810.05 MiB)
+    QWEN38_NO_VISION_WEIGHTS_MB = 20028.79  # Measured on RTX 5090 after stripping model.visual.* (-878.77 MiB)
+    QWEN38_MTP_MODULE_BF16_MB = 810.05      # mtp.fc + mtp.layers.0 (unquantized BF16 = 3.22x a normal layer!)
+    QWEN38_MTP_MODULE_FP8_SAVINGS_MB = 355.00  # Quantizing mtp.layers.0 linear weights BF16 -> FP8
     QWEN38_VISION_TOWER_MB = 878.77
-    QWEN38_TEXT_ONLY_MB = 20027.13
     QWEN38_AVG_LAYER_MB = 251.72
-    QWEN38_FP8_KV_BYTES_PER_TOKEN = 32768  # 16 full_attention layers * 2 * 4 kv_heads * 256 head_dim * 1B
-    QWEN38_MTP_KV_BYTES_PER_TOKEN = 4096   # mtp.layers.0.self_attn (1 layer * 2 * 4 kv_heads * 256 head_dim * 2B BF16)
-    QWEN38_LINEAR_ATTN_STATE_MB = 240.0    # 48 Gated DeltaNet recurrent + conv states + MTP speculative buffers
-    QWEN38_VLLM_RUNTIME_GRAPHS_MB = 1024.0 # vLLM CUDA graphs + sampler logits [B, 248320] + workspace
+    QWEN38_FP8_KV_BYTES_PER_TOKEN = 32768   # 16 full_attention layers * 2 * 4 kv_heads * 256 head_dim * 1B
+    QWEN38_MTP_KV_BF16_BYTES_PER_TOKEN = 4096  # mtp.layers.0.self_attn in BF16 (1,024 MiB @ 256K)
+    QWEN38_MTP_KV_FP8_BYTES_PER_TOKEN = 2048   # mtp.layers.0.self_attn in FP8 (512 MiB @ 256K)
+    QWEN38_MTP_KV_INT4_BYTES_PER_TOKEN = 1024  # mtp.layers.0.self_attn in 4-bit (256 MiB @ 256K)
+    QWEN38_CUDA_CTX_AND_4_GRAPHS_MB = 892.00   # CUDA context + 4 CUDA Graphs for batch sizes [1, 2, 4, 8]
+    QWEN38_DELTANET_AND_WORKSPACE_MB = 1200.00 # 48 Gated DeltaNet states (240 MiB) + prefill workspace (960 MiB)
     D1_3B_TOTAL_LOADED_MB = 3741.12
-    D1_3B_LANGUAGE_LAYERS_MB = 2326.03     # 30 INT8 W8A8 layers (77.53 MiB/layer)
+    D1_3B_NO_VISION_LOADED_MB = 2916.93     # Measured on RTX 5090 after deleting vision_tower & projector (-824.19 MiB)
+    D1_3B_LANGUAGE_LAYERS_MB = 2326.03      # 30 INT8 W8A8 layers (77.53 MiB/layer)
     D1_3B_VISION_TOWER_MB = 813.07
     D1_3B_EMBEDDINGS_MB = 602.01
     D1_3B_ACTIVATION_OVERHEAD_8K_MB = 1214.03
@@ -206,13 +211,17 @@ class LiquidD1DecisionEngine:
         max_chunk_tokens: int = DEFAULT_SAFE_CHUNK_TOKENS,
         chunk_overlap_tokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS,
         superbatch_token_budget: int = DEFAULT_SUPERBATCH_TOKEN_BUDGET,
+        strip_vision_tower: bool = True,
     ) -> None:
+        import gc
+
         apply_torchao_d1_compat_shim()
         self.resolved_path = resolve_local_d1_path(model_id_or_path)
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.max_chunk_tokens = max_chunk_tokens
         self.chunk_overlap_tokens = chunk_overlap_tokens
         self.superbatch_token_budget = superbatch_token_budget
+        self.strip_vision_tower = strip_vision_tower
 
         from transformers import AutoModel
 
@@ -222,8 +231,23 @@ class LiquidD1DecisionEngine:
             trust_remote_code=True,
         ).to(self.device)
         self.model.eval()
-        # Unlock 256K packed token_budget on SystemOne engine so 16K-28K chunks (x4 questions = 64K-115K)
-        # execute in ONE shared-trunk Tensor Core pass instead of splitting at the default 65,536 limit
+
+        # Strip useless Vision Tower (`siglip2_vision_model` + `multi_modal_projector` = 813.07 MiB)
+        if self.strip_vision_tower:
+            if hasattr(self.model.model, "vision_tower") and self.model.model.vision_tower is not None:
+                del self.model.model.vision_tower
+                self.model.model.vision_tower = None
+            if (
+                hasattr(self.model.model, "multi_modal_projector")
+                and self.model.model.multi_modal_projector is not None
+            ):
+                del self.model.model.multi_modal_projector
+                self.model.model.multi_modal_projector = None
+            gc.collect()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        # Unlock 256K packed token_budget on SystemOne engine
         self.model.engine.token_budget = self.superbatch_token_budget
         if compile_model and self.device.type == "cuda":
             self.model.compile(mode="reduce-overhead")
@@ -239,73 +263,79 @@ class LiquidD1DecisionEngine:
         cls,
         qwen_kv_context_tokens: int = 262144,
         d1_chunk_tokens: int = DEFAULT_SAFE_CHUNK_TOKENS,
-        include_mtp_and_vllm_runtime: bool = True,
-        drop_d1_vision_tower: bool = True,
+        strip_vision_towers: bool = True,
+        mtp_kv_dtype: str = "int4",  # "bf16" | "fp8" | "int4"
+        quantize_mtp_weights_fp8: bool = True,
+        num_cuda_graphs: int = 4,
         total_vram_mb: float = RTX5090_TOTAL_VRAM_MB,
     ) -> Dict[str, Any]:
-        """Computes exact VRAM budget and minimum `Qwen3.8-27B-NVFP4` layers to offload on RTX 5090.
+        """Computes exact RTX 5090 VRAM budget & Qwen3.8 layer offload from real cudaMemGetInfo measurements.
 
-        Accounts for the full ~30.15 GiB (`30,874 MiB`) footprint of `Qwen3.8-27B-NVFP4` at 256K context
-        with MTP (`mtp.layers.0` unquantized BF16 = 810.05 MiB + 1,024 MiB MTP KV cache + 8,192 MiB FP8 KV
-        + 1,024 MiB vLLM CUDA graphs/workspace).
+        1. Strips useless Vision Towers from both Qwen3.8 (-878.77 MiB) and d1-3B (-824.19 MiB).
+        2. Quantizes MTP (`mtp.layers.0`) KV cache to 4-bit (256 MiB @ 256K) or FP8 (512 MiB @ 256K)
+           instead of BF16 (1,024 MiB @ 256K), plus MTP weights BF16 -> FP8 (-355 MiB).
+        3. Limits CUDA Graphs to 4 batch sizes `[1, 2, 4, 8]` (892 MiB total CUDA context + graph pool).
         """
         import math
 
-        qwen_weights_mb = cls.QWEN38_TOTAL_CHECKPOINT_MB
-        main_kv_mb = (qwen_kv_context_tokens * cls.QWEN38_FP8_KV_BYTES_PER_TOKEN) / (1024.0 * 1024.0)
-        mtp_kv_mb = (
-            (qwen_kv_context_tokens * cls.QWEN38_MTP_KV_BYTES_PER_TOKEN) / (1024.0 * 1024.0)
-            if include_mtp_and_vllm_runtime
-            else 0.0
+        free_after_os_mb = total_vram_mb - cls.RTX5090_OS_DRIVER_RESERVED_MB
+        qwen_weights_mb = (
+            cls.QWEN38_NO_VISION_WEIGHTS_MB if strip_vision_towers else cls.QWEN38_TOTAL_CHECKPOINT_MB
         )
-        runtime_mb = cls.QWEN38_VLLM_RUNTIME_GRAPHS_MB if include_mtp_and_vllm_runtime else 512.0
-        qwen_total_footprint_mb = (
-            qwen_weights_mb + main_kv_mb + mtp_kv_mb + cls.QWEN38_LINEAR_ATTN_STATE_MB + runtime_mb
-        )
+        if quantize_mtp_weights_fp8:
+            qwen_weights_mb -= cls.QWEN38_MTP_MODULE_FP8_SAVINGS_MB
 
-        # Transient activation overhead scales linearly ~0.1482 MiB/token on d1-3B-w8a8
+        mtp_kv_bpt = {
+            "bf16": cls.QWEN38_MTP_KV_BF16_BYTES_PER_TOKEN,
+            "fp8": cls.QWEN38_MTP_KV_FP8_BYTES_PER_TOKEN,
+            "int4": cls.QWEN38_MTP_KV_INT4_BYTES_PER_TOKEN,
+        }.get(mtp_kv_dtype.lower(), cls.QWEN38_MTP_KV_INT4_BYTES_PER_TOKEN)
+
+        main_kv_mb = (qwen_kv_context_tokens * cls.QWEN38_FP8_KV_BYTES_PER_TOKEN) / (1024.0 * 1024.0)
+        mtp_kv_mb = (qwen_kv_context_tokens * mtp_kv_bpt) / (1024.0 * 1024.0)
+        total_kv_bpt = cls.QWEN38_FP8_KV_BYTES_PER_TOKEN + mtp_kv_bpt
+
+        # 4 CUDA Graphs [1, 2, 4, 8] = 892 MiB; extra graphs add ~45 MiB each
+        cuda_graphs_mb = cls.QWEN38_CUDA_CTX_AND_4_GRAPHS_MB + max(0, num_cuda_graphs - 4) * 45.0
+        avail_for_kv_mb = (
+            free_after_os_mb
+            - qwen_weights_mb
+            - cuda_graphs_mb
+            - cls.QWEN38_DELTANET_AND_WORKSPACE_MB
+        )
+        max_possible_context_tokens = int((avail_for_kv_mb * 1024.0 * 1024.0) // total_kv_bpt)
+        free_vram_at_target_ctx_mb = avail_for_kv_mb - (main_kv_mb + mtp_kv_mb)
+        fits_target_context = free_vram_at_target_ctx_mb >= 0.0
+
         d1_act_mb = cls.D1_3B_ACTIVATION_OVERHEAD_8K_MB * (d1_chunk_tokens / 8192.0)
         d1_weights_mb = (
-            (cls.D1_3B_TOTAL_LOADED_MB - cls.D1_3B_VISION_TOWER_MB)
-            if drop_d1_vision_tower
-            else cls.D1_3B_TOTAL_LOADED_MB
+            cls.D1_3B_NO_VISION_LOADED_MB if strip_vision_towers else cls.D1_3B_TOTAL_LOADED_MB
         )
         d1_peak_total_mb = d1_weights_mb + d1_act_mb
 
-        free_vram_before_swap_mb = max(0.0, total_vram_mb - qwen_total_footprint_mb)
-        vram_deficit_mb = max(0.0, d1_peak_total_mb - free_vram_before_swap_mb)
-
-        # Option 1: Swap only Qwen decoder layers (251.72 MiB/layer)
-        decoder_only_layers = math.ceil(vram_deficit_mb / cls.QWEN38_AVG_LAYER_MB)
-
-        # Option 2: Swap Qwen's non-prefill MTP (810.05 MiB) + Vision (878.77 MiB) = 1,688.82 MiB first,
-        # then only the remaining deficit from Qwen decoder layers!
-        deficit_after_mtp_visual_mb = max(
-            0.0, vram_deficit_mb - (cls.QWEN38_MTP_MODULE_BF16_MB + cls.QWEN38_VISION_TOWER_MB)
-        )
-        decoder_layers_with_mtp_visual_swap = math.ceil(
-            deficit_after_mtp_visual_mb / cls.QWEN38_AVG_LAYER_MB
-        )
+        vram_deficit_mb = max(0.0, d1_peak_total_mb - max(0.0, free_vram_at_target_ctx_mb))
+        swapped_decoder_layers = math.ceil(vram_deficit_mb / cls.QWEN38_AVG_LAYER_MB)
 
         return {
             "total_vram_mb": round(total_vram_mb, 2),
-            "qwen38_weights_with_mtp_mb": round(qwen_weights_mb, 2),
+            "os_driver_reserved_mb": round(cls.RTX5090_OS_DRIVER_RESERVED_MB, 2),
+            "qwen38_weights_mb": round(qwen_weights_mb, 2),
+            "cuda_ctx_and_graphs_mb": round(cuda_graphs_mb, 2),
+            "num_cuda_graphs": num_cuda_graphs,
+            "mtp_kv_dtype": mtp_kv_dtype,
             "qwen38_main_kv_fp8_mb": round(main_kv_mb, 2),
-            "qwen38_mtp_kv_bf16_mb": round(mtp_kv_mb, 2),
-            "qwen38_total_runtime_footprint_mb": round(qwen_total_footprint_mb, 2),
-            "qwen38_total_runtime_footprint_gib": round(qwen_total_footprint_mb / 1024.0, 2),
-            "free_vram_before_swap_mb": round(free_vram_before_swap_mb, 2),
+            "qwen38_mtp_kv_mb": round(mtp_kv_mb, 2),
+            "avail_for_kv_cache_mb": round(avail_for_kv_mb, 2),
+            "max_possible_context_tokens": max_possible_context_tokens,
+            "fits_target_context_without_oom": fits_target_context,
+            "free_vram_before_swap_mb": round(free_vram_at_target_ctx_mb, 2),
             "d1_chunk_tokens": d1_chunk_tokens,
             "d1_weights_mb": round(d1_weights_mb, 2),
             "d1_transient_activations_mb": round(d1_act_mb, 2),
             "d1_peak_total_mb": round(d1_peak_total_mb, 2),
             "vram_deficit_mb": round(vram_deficit_mb, 2),
-            "swapped_qwen_decoder_layers_only": decoder_only_layers,
-            "swapped_qwen_decoder_layers_with_mtp_and_visual_offload": decoder_layers_with_mtp_visual_swap,
-            "pcie_restore_decoder_only_mb": round(decoder_only_layers * cls.QWEN38_AVG_LAYER_MB, 2),
-            "pcie_restore_with_mtp_visual_mb": round(
-                decoder_layers_with_mtp_visual_swap * cls.QWEN38_AVG_LAYER_MB, 2
-            ),
+            "swapped_qwen_decoder_layers": swapped_decoder_layers,
+            "pcie_restore_mb": round(swapped_decoder_layers * cls.QWEN38_AVG_LAYER_MB, 2),
         }
 
     def split_into_overlapping_token_chunks(

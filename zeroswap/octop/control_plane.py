@@ -132,18 +132,24 @@ class OctopDelegationResult:
 class OctopControlPlane:
     """Co-orchestrates `nvidia/Qwen3.8-27B-NVFP4` (Primary) and `LiquidAI/d1-3B-w8a8` (Decision Model)."""
 
+    MAX_CUDA_GRAPH_BATCH_SIZES: Tuple[int, ...] = (1, 2, 4, 8)
+
     def __init__(
         self,
         d1_engine: LiquidD1DecisionEngine,
         qwen_snapshot_dir: Optional[str] = None,
-        num_swapped_qwen_layers: int = 7,
+        num_swapped_qwen_layers: int = 5,
         kv_cache_mb: int = 1024,
+        mtp_kv_dtype: str = "int4",
+        cuda_graph_batch_sizes: Tuple[int, ...] = MAX_CUDA_GRAPH_BATCH_SIZES,
         device: str = "cuda:0",
     ) -> None:
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.d1_engine = d1_engine
         self.qwen_snapshot_dir = qwen_snapshot_dir or resolve_local_qwen38_nvfp4_path()
         self.num_swapped_qwen_layers = num_swapped_qwen_layers
+        self.mtp_kv_dtype = mtp_kv_dtype
+        self.cuda_graph_batch_sizes = cuda_graph_batch_sizes[:4]  # Strictly cap at 4 CUDA graphs locally
         self.sanitizer = DataSanitizationGate()
         self.external_api = ExternalAPISimulator()
 
@@ -176,11 +182,11 @@ class OctopControlPlane:
     def _allocate_qwen38_paged_kv_cache(
         self, kv_cache_mb: int
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        """Allocates realistic Qwen3.8-27B-NVFP4 PagedAttention KV cache blocks (`num_kv_heads=4, head_dim=256`)."""
+        """Allocates Qwen3.8-27B-NVFP4 PagedAttention KV cache (`FP8` main + `4-bit`/`FP8` MTP KV cache)."""
         block_size = 16
         num_kv_heads = 4
         head_dim = 256
-        # Each block in FP8 (uint8 storage) is 2 (K+V) * 16 * 4 * 256 = 32,768 bytes (32 KB)
+        # Main 16 full_attention layers in FP8 (uint8 storage): 2 * 16 * 4 * 256 = 32,768 bytes/block
         bytes_per_block = 2 * block_size * num_kv_heads * head_dim
         total_blocks = max(64, (kv_cache_mb * 1024 * 1024) // bytes_per_block)
         kv_pool = torch.randint(
@@ -190,8 +196,20 @@ class OctopControlPlane:
             dtype=torch.uint8,
             device=self.device,
         )
+        # MTP layer (`mtp.layers.0.self_attn`) KV cache in 4-bit packed (`head_dim // 2`) or FP8
+        mtp_packed_dim = head_dim // 2 if self.mtp_kv_dtype.lower() == "int4" else head_dim
+        mtp_kv_pool = torch.randint(
+            0,
+            255,
+            (total_blocks // 16, 2, block_size, num_kv_heads, mtp_packed_dim),
+            dtype=torch.uint8,
+            device=self.device,
+        )
         block_tables = torch.arange(0, total_blocks, dtype=torch.int32, device=self.device).reshape(16, -1)
-        return {"qwen38_fp8_paged_kv_pool": kv_pool}, block_tables
+        return {
+            "qwen38_fp8_paged_kv_pool": kv_pool,
+            f"qwen38_mtp_{self.mtp_kv_dtype}_paged_kv_pool": mtp_kv_pool,
+        }, block_tables
 
     def _load_real_qwen38_safetensors_layers(self) -> None:
         """Loads authentic `nvidia/Qwen3.8-27B-NVFP4` tail layers from disk into StaticSlab (GPU) & PinnedHostPool (RAM)."""
