@@ -167,6 +167,10 @@ def resolve_local_d1_path(model_id_or_path: str = DEFAULT_D1_REPO) -> str:
 class LiquidD1DecisionEngine:
     """Manages the real `LiquidAI/d1-3B-w8a8` INT8 W8A8 decision model for Octop API safety checks."""
 
+    MAX_D1_CONTEXT_TOKENS = 32768
+    DEFAULT_SAFE_CHUNK_TOKENS = 16384
+    DEFAULT_CHUNK_OVERLAP_TOKENS = 512
+
     CRITICAL_LOCAL_ONLY_MARKERS = (
         "BEGIN RSA PRIVATE KEY",
         "BEGIN OPENSSH PRIVATE KEY",
@@ -181,10 +185,14 @@ class LiquidD1DecisionEngine:
         model_id_or_path: str = DEFAULT_D1_REPO,
         device: str = "cuda:0",
         compile_model: bool = False,
+        max_chunk_tokens: int = DEFAULT_SAFE_CHUNK_TOKENS,
+        chunk_overlap_tokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS,
     ) -> None:
         apply_torchao_d1_compat_shim()
         self.resolved_path = resolve_local_d1_path(model_id_or_path)
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.max_chunk_tokens = max_chunk_tokens
+        self.chunk_overlap_tokens = chunk_overlap_tokens
 
         from transformers import AutoModel
 
@@ -203,12 +211,130 @@ class LiquidD1DecisionEngine:
         """Returns the 30 hybrid (`conv` + `full_attention` + `MLP`) layers of `LiquidAI/d1-3B-w8a8`."""
         return self.model.model.language_model.layers
 
+    def split_into_overlapping_token_chunks(
+        self,
+        text: str,
+        max_chunk_tokens: Optional[int] = None,
+        overlap_tokens: Optional[int] = None,
+    ) -> List[str]:
+        """Splits an arbitrarily long LLM context (e.g. 256K Qwen3.8 context) into overlapping token windows.
+
+        Overlapping windows (`overlap_tokens`, default 512) guarantee that multi-token secrets
+        (such as RSA private headers, JWTs, AWS keys, or PII) cannot be sliced across a boundary
+        to evade detection.
+        """
+        chunk_limit = max_chunk_tokens or self.max_chunk_tokens
+        overlap = overlap_tokens if overlap_tokens is not None else self.chunk_overlap_tokens
+        if overlap >= chunk_limit:
+            overlap = max(1, chunk_limit // 4)
+
+        tokenizer = self.model.engine.tokenizer
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(token_ids) <= chunk_limit:
+            return [text]
+
+        step = chunk_limit - overlap
+        chunks: List[str] = []
+        for start in range(0, len(token_ids), step):
+            window_ids = token_ids[start : start + chunk_limit]
+            if not window_ids:
+                break
+            chunks.append(tokenizer.decode(window_ids, skip_special_tokens=False))
+            if start + chunk_limit >= len(token_ids):
+                break
+        return chunks
+
+    def evaluate_octop_long_context(
+        self,
+        candidate_prompt: str,
+        max_chunk_tokens: Optional[int] = None,
+        overlap_tokens: Optional[int] = None,
+    ) -> OctopSafetyDecision:
+        """Evaluates contexts exceeding `LiquidAI/d1-3B-w8a8`'s 32K window via Super-Batch Sliding Windows.
+
+        1. Splits the long context into overlapping token chunks (`W` tokens, overlap `O` tokens).
+        2. Evaluates all `K` chunks x 4 Octop safety questions in ONE packed INT8 Tensor Core super-batch.
+        3. Applies Strict Monotonic Security Reduction (`Min-Safe / Max-Risk`):
+           - A leak or censorship trigger in ANY single chunk flags the entire payload.
+        """
+        chunks = self.split_into_overlapping_token_chunks(
+            candidate_prompt,
+            max_chunk_tokens=max_chunk_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+        if len(chunks) == 1:
+            return self.evaluate_octop_delegation(chunks[0], allow_chunking=False)
+
+        chunk_decisions, telemetry = self.evaluate_octop_superbatch_packed(chunks)
+
+        # Strict Monotonic Security Reduction (Min-Safe / Max-Risk across all sliding windows)
+        min_safe_idx = min(
+            range(len(chunk_decisions)),
+            key=lambda idx: chunk_decisions[idx].safe_for_retention_prob,
+        )
+        worst_decision = chunk_decisions[min_safe_idx]
+        min_safe_prob = min(d.safe_for_retention_prob for d in chunk_decisions)
+        max_censor_prob = max(d.censorship_trigger_prob for d in chunk_decisions)
+        max_severity = max(d.retention_severity_score for d in chunk_decisions)
+
+        action_priority = {
+            "reject_force_local_execution": 3,
+            "sanitize_and_decompose_microtasks": 2,
+            "delegate_to_external_api": 1,
+        }
+        strictest_action = max(
+            (d.decision_action for d in chunk_decisions),
+            key=lambda a: action_priority.get(a, 2),
+        )
+        approved = (
+            all(d.approved_for_external_api for d in chunk_decisions)
+            and strictest_action == "delegate_to_external_api"
+        )
+
+        merged_raw = dict(worst_decision.raw_answers)
+        merged_raw["long_context_overflow"] = {
+            "chunks_evaluated": len(chunks),
+            "worst_chunk_index": min_safe_idx,
+            "per_chunk_safe_probs": [d.safe_for_retention_prob for d in chunk_decisions],
+            "per_chunk_actions": [d.decision_action for d in chunk_decisions],
+            "superbatch_telemetry": telemetry,
+        }
+
+        return OctopSafetyDecision(
+            approved_for_external_api=approved,
+            decision_action=strictest_action,
+            decision_confidence=worst_decision.decision_confidence,
+            safe_for_retention_prob=round(min_safe_prob, 4),
+            censorship_trigger_prob=round(max_censor_prob, 4),
+            retention_severity_score=round(max_severity, 4),
+            reason_code=worst_decision.reason_code,
+            feedback_for_orchestrator=worst_decision.feedback_for_orchestrator,
+            input_tokens=sum(d.input_tokens for d in chunk_decisions),
+            output_tokens=0,
+            inference_ms=round(float(telemetry.get("wall_time_ms", worst_decision.inference_ms)), 2),
+            raw_answers=merged_raw,
+        )
+
     def evaluate_octop_delegation(
         self,
         candidate_prompt: str | Mapping[str, Any],
         extra_context: Optional[Mapping[str, Any]] = None,
+        allow_chunking: bool = True,
     ) -> OctopSafetyDecision:
-        """Runs a single-pass System One evaluation (`output_tokens=0`) on `LiquidAI/d1-3B-w8a8`."""
+        """Runs a single-pass System One evaluation (`output_tokens=0`) on `LiquidAI/d1-3B-w8a8`.
+
+        Automatically engages Sliding-Window Super-Batch Chunking if the candidate prompt exceeds
+        `self.max_chunk_tokens` (preventing 32K RoPE context overflow or middle-of-context secret hiding).
+        """
+        if allow_chunking and isinstance(candidate_prompt, str):
+            # Fast char-level heuristic before invoking tokenizer: ~2.5 chars/token lower bound
+            if len(candidate_prompt) > self.max_chunk_tokens * 2:
+                tok_len = len(
+                    self.model.engine.tokenizer.encode(candidate_prompt, add_special_tokens=False)
+                )
+                if tok_len > self.max_chunk_tokens:
+                    return self.evaluate_octop_long_context(candidate_prompt)
+
         state_obj: Any
         if extra_context:
             state_obj = {

@@ -203,3 +203,40 @@ def test_octop_batch_packed_zero_padding_decisions(shared_octop_plane: OctopCont
     assert decisions[0].safe_for_retention_prob > 0.80
     assert decisions[2].safe_for_retention_prob > 0.80
     assert decisions[1].safe_for_retention_prob < 0.30
+
+
+def test_octop_long_context_overflow_sliding_window_needle_detection(
+    shared_octop_plane: OctopControlPlane,
+) -> None:
+    """Verifies Sliding-Window Super-Batch Chunking when LLM context exceeds d1-3B's chunk window.
+
+    Embeds a secret API key + PII needle inside the middle chunk of a multi-chunk context
+    while the first and last chunks are 100% benign mathematical code.
+    """
+    benign_block = (
+        "def matrix_multiply_block(A, B):\n"
+        "    # Pure mathematical block matrix multiplication in Python\n"
+        "    return [[sum(a * b for a, b in zip(row, col)) for col in zip(*B)] for row in A]\n"
+    ) * 20
+    secret_needle = (
+        "\n# INTERNAL PRODUCTION CREDENTIALS DO NOT SHARE:\n"
+        "OPENAI_API_KEY = 'sk-proj-99887766554433221100aabbccddeeff'\n"
+        "DB_HOST = '10.24.88.105'\n"
+        "CUSTOMER_PESEL = '91041512345'\n"
+    )
+    overflow_prompt = benign_block + secret_needle + benign_block
+
+    decision = shared_octop_plane.d1_engine.evaluate_octop_long_context(
+        overflow_prompt,
+        max_chunk_tokens=256,
+        overlap_tokens=64,
+    )
+    overflow_meta = decision.raw_answers.get("long_context_overflow", {})
+    assert overflow_meta.get("chunks_evaluated", 0) >= 3
+    assert decision.output_tokens == 0
+    assert decision.approved_for_external_api is False
+    assert decision.safe_for_retention_prob < 0.35
+    assert decision.decision_action in (
+        "sanitize_and_decompose_microtasks",
+        "reject_force_local_execution",
+    )
