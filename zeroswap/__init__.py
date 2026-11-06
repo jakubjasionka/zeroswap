@@ -10,8 +10,15 @@ from zeroswap.optimizer.kv_budget import KVBudgetPlanner
 from zeroswap.optimizer.router import RuntimeDecisionRouter
 from zeroswap.guardrail.sanitizer import DataSanitizationGate
 from zeroswap.guardrail.gate import GuardrailGate, gate
+from zeroswap.octop import (
+    ExternalAPISimulator,
+    LiquidD1DecisionEngine,
+    OctopControlPlane,
+    OctopDelegationResult,
+    OctopSafetyDecision,
+)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "EngineConfig",
@@ -28,4 +35,9 @@ __all__ = [
     "DataSanitizationGate",
     "GuardrailGate",
     "gate",
+    "LiquidD1DecisionEngine",
+    "OctopSafetyDecision",
+    "OctopControlPlane",
+    "OctopDelegationResult",
+    "ExternalAPISimulator",
 ]

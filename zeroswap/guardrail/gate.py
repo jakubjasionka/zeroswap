@@ -65,6 +65,11 @@ class GuardrailGate:
         self.interceptor = interceptor
         self.secondary_layers = secondary_layers
         self.sanitizer = DataSanitizationGate()
+        self.d1_engine: Optional[Any] = None
+
+    def attach_d1_engine(self, d1_engine: Any) -> None:
+        """Attaches a real `LiquidD1DecisionEngine` (`LiquidAI/d1-3B-w8a8`) for single-pass safety evaluation."""
+        self.d1_engine = d1_engine
 
     def attach_runtime(
         self,
@@ -147,6 +152,13 @@ class GuardrailGate:
         approved = True
         reason_code = "OK"
         feedback_msg: Optional[str] = None
+
+        if self.d1_engine is not None:
+            d1_dec = self.d1_engine.evaluate_octop_delegation(working_text)
+            if not d1_dec.approved_for_external_api and d1_dec.decision_action == "reject_force_local_execution":
+                approved = False
+                reason_code = d1_dec.reason_code
+                feedback_msg = d1_dec.feedback_for_orchestrator
 
         for code, triggers in self.DANGEROUS_PATTERNS:
             if any(trig in working_text for trig in triggers):

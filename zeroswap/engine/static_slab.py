@@ -1,16 +1,17 @@
 """StaticSlab: Pre-allocated virtual GPU memory slab & KV Cache / CUDA Graph Invariant verifier.
 
 Guarantees that:
-1. All dynamically swapped transformer layer parameters keep identical virtual GPU memory
-   addresses (`data_ptr()`), tensor shapes, and strides across overwrites and restores,
-   preventing CUDA Graph invalidation or re-compilation.
+1. All dynamically swapped transformer layer parameters (including standard PyTorch tensors,
+   NVFP4/FP8 quantized safetensors, and torchao W8A8 `Int8Tensor` subclasses) keep identical
+   virtual GPU memory addresses (`data_ptr()`), tensor shapes, and strides across overwrites
+   and restores, preventing CUDA Graph invalidation or re-compilation.
 2. PagedAttention KV cache pools and block tables remain 100% isolated and unmodified.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
@@ -28,6 +29,18 @@ class TensorSignature:
     dtype: torch.dtype
     numel: int
     nbytes: int
+
+
+def iter_leaf_tensors(prefix: str, tensor: torch.Tensor) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Unwraps tensor subclasses (e.g., torchao `Int8Tensor` / `AffineQuantizedTensor`) into contiguous leaf tensors."""
+    if type(tensor) is not torch.Tensor and hasattr(tensor, "__tensor_flatten__"):
+        attr_names, _ = tensor.__tensor_flatten__()
+        for attr in attr_names:
+            sub = getattr(tensor, attr, None)
+            if isinstance(sub, torch.Tensor):
+                yield from iter_leaf_tensors(f"{prefix}.{attr}", sub)
+        return
+    yield prefix, tensor.data if isinstance(tensor, nn.Parameter) else tensor
 
 
 class StaticSlab:
@@ -60,7 +73,7 @@ class StaticSlab:
 
     def mark_evicted_zero_copy(self) -> None:
         """One-Way In-Place Overwrite: 0.0 ms logical eviction without DtoH copy or memset."""
-        self._slab_state = " logically_free_for_overwrite"
+        self._slab_state = "logically_free_for_overwrite"
 
     def mark_secondary_loaded(self) -> None:
         self._slab_state = "secondary_loaded"
@@ -103,41 +116,37 @@ class StaticSlab:
                 nbytes=block_tables.numel() * block_tables.element_size(),
             )
 
-    def register_swappable_layer(self, layer_idx: int, module: nn.Module) -> int:
-        """Records fixed GPU pointer signatures for a swappable transformer layer."""
+    def register_swappable_tensor_dict(self, layer_idx: int, tensor_dict: Dict[str, torch.Tensor]) -> int:
+        """Records fixed GPU pointer signatures for a raw dictionary of layer tensors (e.g. NVFP4 safetensors)."""
         sigs: Dict[str, TensorSignature] = {}
         params: Dict[str, torch.Tensor] = {}
         total_bytes = 0
-        for name, param in module.named_parameters(recurse=True):
-            t = param.data
-            nbytes = t.numel() * t.element_size()
-            sigs[name] = TensorSignature(
-                name=name,
-                data_ptr=t.data_ptr(),
-                shape=tuple(t.shape),
-                stride=tuple(t.stride()),
-                dtype=t.dtype,
-                numel=t.numel(),
-                nbytes=nbytes,
-            )
-            params[name] = t
-            total_bytes += nbytes
-        for name, buf in module.named_buffers(recurse=True):
-            nbytes = buf.numel() * buf.element_size()
-            sigs[f"buf:{name}"] = TensorSignature(
-                name=f"buf:{name}",
-                data_ptr=buf.data_ptr(),
-                shape=tuple(buf.shape),
-                stride=tuple(buf.stride()),
-                dtype=buf.dtype,
-                numel=buf.numel(),
-                nbytes=nbytes,
-            )
-            params[f"buf:{name}"] = buf
-            total_bytes += nbytes
+        for raw_name, raw_tensor in tensor_dict.items():
+            for leaf_name, t in iter_leaf_tensors(raw_name, raw_tensor):
+                nbytes = t.numel() * t.element_size()
+                sigs[leaf_name] = TensorSignature(
+                    name=leaf_name,
+                    data_ptr=t.data_ptr(),
+                    shape=tuple(t.shape),
+                    stride=tuple(t.stride()),
+                    dtype=t.dtype,
+                    numel=t.numel(),
+                    nbytes=nbytes,
+                )
+                params[leaf_name] = t
+                total_bytes += nbytes
         self.layer_signatures[layer_idx] = sigs
         self.layer_params[layer_idx] = params
         return total_bytes
+
+    def register_swappable_layer(self, layer_idx: int, module: nn.Module) -> int:
+        """Records fixed GPU pointer signatures for a swappable transformer layer (`nn.Module`)."""
+        raw_dict: Dict[str, torch.Tensor] = {}
+        for name, param in module.named_parameters(recurse=True):
+            raw_dict[name] = param
+        for name, buf in module.named_buffers(recurse=True):
+            raw_dict[f"buf:{name}"] = buf
+        return self.register_swappable_tensor_dict(layer_idx, raw_dict)
 
     def verify_layer_pointers_invariant(self, layer_idx: int) -> bool:
         """Confirms that CUDA Graph virtual addresses (`data_ptr()`) for `layer_idx` have not shifted."""
@@ -204,7 +213,7 @@ class StaticSlab:
             chunk_len = min(nbytes, max(0, total_src - offset))
             if chunk_len <= 0:
                 break
-            flat_uint8_view = tensor.view(torch.uint8).reshape(-1)
+            flat_uint8_view = tensor.reshape(-1).view(torch.uint8)
             flat_uint8_view[:chunk_len].copy_(
                 source_bytes_tensor[offset : offset + chunk_len], non_blocking=True
             )

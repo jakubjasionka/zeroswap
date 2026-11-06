@@ -61,9 +61,12 @@ class KVBudgetPlanner:
                 math.ceil(desired_slab_mb / max(1.0, base_model.layer_size_mb)),
             ),
         )
+        non_layer_overhead_mb = max(
+            0.0, base_model.total_weight_mb - (base_model.num_layers * base_model.layer_size_mb)
+        )
         actual_slab_mb = swapped_layers * base_model.layer_size_mb
         resident_layers = base_model.num_layers - swapped_layers
-        resident_weights_mb = resident_layers * base_model.layer_size_mb
+        resident_weights_mb = non_layer_overhead_mb + resident_layers * base_model.layer_size_mb
         ping_pong_buffer_mb = 2.0 * guest_model.layer_size_mb
 
         free_kv_mb = usable_vram_mb - resident_weights_mb - actual_slab_mb

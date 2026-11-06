@@ -1,7 +1,8 @@
 """PCIeStreamer: Dual CUDA Streams (High-Priority Copy Stream + Compute Stream) & Event Barriers.
 
 Implements:
-1. One-Way HtoD In-Place Overwrite (`cudaMemcpyAsync` via `copy_(..., non_blocking=True)`).
+1. One-Way HtoD In-Place Overwrite via native C++/CUDA extension `zeroswap_cuda_ext`
+   (`async_batch_inplace_h2d_overwrite` / `cudaMemcpyAsync`) with PyTorch fallback.
 2. Event-synchronized latency hiding (`cudaStreamWaitEvent`) so PCIe transfers execute
    underneath the resident layers' forward pass.
 3. Ping-Pong Double Buffering (2 slots in GPU memory) for streaming secondary guardrail layers
@@ -16,7 +17,18 @@ import torch
 import torch.nn as nn
 
 from zeroswap.engine.pinned_host import PinnedHostPool
-from zeroswap.engine.static_slab import StaticSlab
+from zeroswap.engine.static_slab import StaticSlab, iter_leaf_tensors
+
+try:
+    import zeroswap_cuda_ext as _cuda_ext
+    HAS_NATIVE_CUDA_EXT = True
+except ImportError:
+    try:
+        from zeroswap.engine import zeroswap_cuda_ext as _cuda_ext  # type: ignore[no-redef]
+        HAS_NATIVE_CUDA_EXT = True
+    except ImportError:
+        _cuda_ext = None
+        HAS_NATIVE_CUDA_EXT = False
 
 
 class PCIeStreamer:
@@ -32,6 +44,7 @@ class PCIeStreamer:
         self.host_pool = host_pool
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.use_cuda = self.device.type == "cuda" and torch.cuda.is_available()
+        self.use_native_cuda_ext = bool(self.use_cuda and HAS_NATIVE_CUDA_EXT)
 
         if self.use_cuda:
             # High-priority DMA Copy Stream (-1) and standard Compute Stream (0)
@@ -43,15 +56,45 @@ class PCIeStreamer:
 
         self.primary_restore_events: Dict[int, torch.cuda.Event] = {}
         self.secondary_load_events: Dict[int, torch.cuda.Event] = {}
+        self.total_bytes_streamed_h2d: int = 0
 
     def _copy_layer_dict_inplace(
         self,
         target_params: Dict[str, torch.Tensor],
         source_pinned: Dict[str, torch.Tensor],
-    ) -> None:
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> int:
+        if (
+            self.use_native_cuda_ext
+            and _cuda_ext is not None
+            and stream is not None
+        ):
+            dst_list: List[torch.Tensor] = []
+            src_list: List[torch.Tensor] = []
+            for name, dst_tensor in target_params.items():
+                if name in source_pinned:
+                    src_tensor = source_pinned[name]
+                    if dst_tensor.is_cuda and not src_tensor.is_cuda and dst_tensor.is_contiguous() and src_tensor.is_contiguous():
+                        dst_list.append(dst_tensor)
+                        src_list.append(src_tensor)
+                    else:
+                        dst_tensor.copy_(src_tensor, non_blocking=self.use_cuda)
+            if dst_list:
+                copied = int(
+                    _cuda_ext.async_batch_inplace_h2d_overwrite(
+                        dst_list, src_list, int(stream.cuda_stream)
+                    )
+                )
+                self.total_bytes_streamed_h2d += copied
+                return copied
+
+        copied_bytes = 0
         for name, dst_tensor in target_params.items():
             if name in source_pinned:
                 dst_tensor.copy_(source_pinned[name], non_blocking=self.use_cuda)
+                copied_bytes += dst_tensor.numel() * dst_tensor.element_size()
+        self.total_bytes_streamed_h2d += copied_bytes
+        return copied_bytes
 
     def async_restore_primary_layer(self, layer_idx: int) -> None:
         """Asynchronously copies a primary layer's Golden Image from Pinned RAM to its StaticSlab GPU address."""
@@ -62,7 +105,7 @@ class PCIeStreamer:
             # Ensure copy_stream waits for any pending compute on the slab before overwriting
             self.copy_stream.wait_stream(torch.cuda.current_stream(self.device))
             with torch.cuda.stream(self.copy_stream):
-                self._copy_layer_dict_inplace(target_params, source_pinned)
+                self._copy_layer_dict_inplace(target_params, source_pinned, stream=self.copy_stream)
                 ev = torch.cuda.Event(enable_timing=False)
                 ev.record(self.copy_stream)
                 self.primary_restore_events[layer_idx] = ev
@@ -81,10 +124,21 @@ class PCIeStreamer:
             ev = self.primary_restore_events[layer_idx]
             torch.cuda.current_stream(self.device).wait_event(ev)
 
+    def extract_module_leaf_map(self, module: nn.Module) -> Dict[str, torch.Tensor]:
+        """Extracts leaf tensor map (including torchao `Int8Tensor` `qdata`/`scale` leaves) for a module."""
+        leaf_map: Dict[str, torch.Tensor] = {}
+        for name, param in module.named_parameters(recurse=True):
+            for leaf_name, t in iter_leaf_tensors(name, param):
+                leaf_map[leaf_name] = t
+        for name, buf in module.named_buffers(recurse=True):
+            for leaf_name, t in iter_leaf_tensors(f"buf:{name}", buf):
+                leaf_map[leaf_name] = t
+        return leaf_map
+
     def overwrite_slab_with_secondary(
         self,
         target_layer_indices: List[int],
-        secondary_gpu_modules: Optional[List[nn.Module]] = None,
+        secondary_gpu_modules: Optional[List[nn.Module] | nn.ModuleList] = None,
     ) -> None:
         """One-Way In-Place Overwrite: 0 ms offload of primary layers + async HtoD load of secondary weights."""
         # Step 1: Logical 0 ms eviction (no DtoH transfer needed since Golden Image lives in Pinned RAM)
@@ -94,19 +148,21 @@ class PCIeStreamer:
         if self.use_cuda and self.copy_stream is not None:
             self.copy_stream.wait_stream(torch.cuda.current_stream(self.device))
             with torch.cuda.stream(self.copy_stream):
-                for slot_idx, layer_idx in enumerate(target_layer_indices):
+                num_slots = (
+                    max(len(target_layer_indices), len(secondary_gpu_modules))
+                    if secondary_gpu_modules is not None
+                    else len(target_layer_indices)
+                )
+                for slot_idx in range(num_slots):
                     if slot_idx in self.host_pool.secondary_golden_layers:
                         sec_mirror = self.host_pool.get_secondary_layer_mirror(slot_idx)
                         if secondary_gpu_modules is not None and slot_idx < len(secondary_gpu_modules):
-                            dst_map = {
-                                k: v.data
-                                for k, v in secondary_gpu_modules[slot_idx].named_parameters(recurse=True)
-                            }
-                            self._copy_layer_dict_inplace(dst_map, sec_mirror)
-                        else:
-                            # Overwrite primary slab memory directly in-place to simulate unified slab reuse
+                            dst_map = self.extract_module_leaf_map(secondary_gpu_modules[slot_idx])
+                            self._copy_layer_dict_inplace(dst_map, sec_mirror, stream=self.copy_stream)
+                        elif slot_idx < len(target_layer_indices):
+                            layer_idx = target_layer_indices[slot_idx]
                             flat_chunks = [
-                                t.view(torch.uint8).reshape(-1) for t in sec_mirror.values()
+                                t.reshape(-1).view(torch.uint8) for t in sec_mirror.values()
                             ]
                             if flat_chunks:
                                 combined = torch.cat(flat_chunks, dim=0)
@@ -115,6 +171,13 @@ class PCIeStreamer:
                         ev.record(self.copy_stream)
                         self.secondary_load_events[slot_idx] = ev
         self.slab.mark_secondary_loaded()
+
+    def wait_secondary_ready(self) -> None:
+        """Synchronizes compute stream with all in-flight secondary layer DMA transfers."""
+        if self.use_cuda:
+            cur_stream = torch.cuda.current_stream(self.device)
+            for ev in self.secondary_load_events.values():
+                cur_stream.wait_event(ev)
 
     def pipelined_secondary_forward(
         self,
@@ -131,13 +194,7 @@ class PCIeStreamer:
         slot_a = copy.deepcopy(layer_template).to(self.device)
         slot_b = copy.deepcopy(layer_template).to(self.device)
         slots = [slot_a, slot_b]
-        slot_params = [
-            {
-                **{k: v.data for k, v in slot.named_parameters(recurse=True)},
-                **{f"buf:{k}": v for k, v in slot.named_buffers(recurse=True)},
-            }
-            for slot in slots
-        ]
+        slot_params = [self.extract_module_leaf_map(slot) for slot in slots]
 
         # Mark primary slab logically overwritten (0 ms DtoH)
         self.slab.mark_evicted_zero_copy()
@@ -151,7 +208,7 @@ class PCIeStreamer:
                 if slot_id in compute_done_events:
                     self.copy_stream.wait_event(compute_done_events[slot_id])
                 with torch.cuda.stream(self.copy_stream):
-                    self._copy_layer_dict_inplace(slot_params[slot_id], mirror)
+                    self._copy_layer_dict_inplace(slot_params[slot_id], mirror, stream=self.copy_stream)
                     ev = torch.cuda.Event(enable_timing=False)
                     ev.record(self.copy_stream)
                     events[layer_idx] = ev

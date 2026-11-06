@@ -2,7 +2,7 @@
 
 Maintains the read-only Golden Image of both the Primary Orchestrator's swapped layers
 and the Secondary Guardrail model in page-locked system RAM so the PCIe DMA engine can
-stream HtoD transfers at full link bandwidth (~25 GB/s PCIe 4.0 / ~50 GB/s PCIe 5.0)
+stream HtoD transfers at full link bandwidth (~26 GB/s PCIe 4.0 / ~52 GB/s PCIe 5.0)
 with zero CPU paging overhead and zero DtoH offload cost.
 """
 
@@ -11,6 +11,8 @@ from __future__ import annotations
 from typing import Dict, List
 import torch
 import torch.nn as nn
+
+from zeroswap.engine.static_slab import iter_leaf_tensors
 
 
 class PinnedHostPool:
@@ -23,45 +25,60 @@ class PinnedHostPool:
         self.total_pinned_bytes: int = 0
 
     def _allocate_pinned_copy(self, tensor: torch.Tensor) -> torch.Tensor:
+        src = tensor.detach().contiguous()
         host_tensor = torch.empty(
-            tensor.shape,
-            dtype=tensor.dtype,
+            src.shape,
+            dtype=src.dtype,
             device="cpu",
             pin_memory=self.pin_memory,
         )
-        host_tensor.copy_(tensor.detach(), non_blocking=False)
+        host_tensor.copy_(src, non_blocking=False)
         self.total_pinned_bytes += host_tensor.numel() * host_tensor.element_size()
         return host_tensor
 
-    def mirror_primary_layer(self, layer_idx: int, module: nn.Module) -> int:
-        """Creates an immutable page-locked RAM Golden Image of a primary model layer."""
+    def mirror_primary_tensor_dict(self, layer_idx: int, tensor_dict: Dict[str, torch.Tensor]) -> int:
+        """Creates an immutable page-locked RAM Golden Image of a raw layer tensor dictionary."""
         layer_mirror: Dict[str, torch.Tensor] = {}
         layer_bytes = 0
-        for name, param in module.named_parameters(recurse=True):
-            pinned = self._allocate_pinned_copy(param.data)
-            layer_mirror[name] = pinned
-            layer_bytes += pinned.numel() * pinned.element_size()
-        for name, buf in module.named_buffers(recurse=True):
-            pinned = self._allocate_pinned_copy(buf)
-            layer_mirror[f"buf:{name}"] = pinned
-            layer_bytes += pinned.numel() * pinned.element_size()
+        for raw_name, raw_tensor in tensor_dict.items():
+            for leaf_name, t in iter_leaf_tensors(raw_name, raw_tensor):
+                pinned = self._allocate_pinned_copy(t)
+                layer_mirror[leaf_name] = pinned
+                layer_bytes += pinned.numel() * pinned.element_size()
         self.primary_golden_layers[layer_idx] = layer_mirror
         return layer_bytes
 
+    def mirror_primary_layer(self, layer_idx: int, module: nn.Module) -> int:
+        """Creates an immutable page-locked RAM Golden Image of a primary model layer (`nn.Module`)."""
+        raw_dict: Dict[str, torch.Tensor] = {}
+        for name, param in module.named_parameters(recurse=True):
+            raw_dict[name] = param
+        for name, buf in module.named_buffers(recurse=True):
+            raw_dict[f"buf:{name}"] = buf
+        return self.mirror_primary_tensor_dict(layer_idx, raw_dict)
+
+    def mirror_secondary_tensor_dict(self, layer_idx: int, tensor_dict: Dict[str, torch.Tensor]) -> int:
+        """Mirrors a single secondary layer's tensors into page-locked RAM."""
+        layer_mirror: Dict[str, torch.Tensor] = {}
+        layer_bytes = 0
+        for raw_name, raw_tensor in tensor_dict.items():
+            for leaf_name, t in iter_leaf_tensors(raw_name, raw_tensor):
+                pinned = self._allocate_pinned_copy(t)
+                layer_mirror[leaf_name] = pinned
+                layer_bytes += pinned.numel() * pinned.element_size()
+        self.secondary_golden_layers[layer_idx] = layer_mirror
+        return layer_bytes
+
     def mirror_secondary_model(self, layers: nn.ModuleList | List[nn.Module]) -> int:
-        """Mirrors all layers of the secondary guardrail model into page-locked RAM."""
+        """Mirrors all layers of the secondary guardrail/decision model into page-locked RAM."""
         total_bytes = 0
         for idx, layer in enumerate(layers):
-            layer_mirror: Dict[str, torch.Tensor] = {}
+            raw_dict: Dict[str, torch.Tensor] = {}
             for name, param in layer.named_parameters(recurse=True):
-                pinned = self._allocate_pinned_copy(param.data)
-                layer_mirror[name] = pinned
-                total_bytes += pinned.numel() * pinned.element_size()
+                raw_dict[name] = param
             for name, buf in layer.named_buffers(recurse=True):
-                pinned = self._allocate_pinned_copy(buf)
-                layer_mirror[f"buf:{name}"] = pinned
-                total_bytes += pinned.numel() * pinned.element_size()
-            self.secondary_golden_layers[idx] = layer_mirror
+                raw_dict[f"buf:{name}"] = buf
+            total_bytes += self.mirror_secondary_tensor_dict(idx, raw_dict)
         return total_bytes
 
     def get_primary_layer_mirror(self, layer_idx: int) -> Dict[str, torch.Tensor]:

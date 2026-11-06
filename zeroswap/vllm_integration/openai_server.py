@@ -166,6 +166,30 @@ def create_zeroswap_app(
             "sanitized_prompt": verdict.sanitized_prompt,
         }
 
+    @app.post("/v1/octop/evaluate")
+    async def octop_evaluate(req: VerifyRequest) -> Dict[str, Any]:
+        """Evaluates external API delegation safety assuming retention & training via `LiquidAI/d1-3B-w8a8`."""
+        if state.get("d1_engine") is None:
+            from zeroswap.octop.d1_decision_model import LiquidD1DecisionEngine
+            state["d1_engine"] = LiquidD1DecisionEngine()
+            gate_inst.attach_d1_engine(state["d1_engine"])
+        dec = state["d1_engine"].evaluate_octop_delegation(req.prompt)
+        san = gate_inst.sanitizer.sanitize(req.prompt)
+        return {
+            "approved_for_external_api": dec.approved_for_external_api,
+            "decision_action": dec.decision_action,
+            "decision_confidence": dec.decision_confidence,
+            "safe_for_retention_prob": dec.safe_for_retention_prob,
+            "censorship_trigger_prob": dec.censorship_trigger_prob,
+            "retention_severity_score": dec.retention_severity_score,
+            "reason_code": dec.reason_code,
+            "feedback_for_orchestrator": dec.feedback_for_orchestrator,
+            "output_tokens": dec.output_tokens,
+            "inference_ms": dec.inference_ms,
+            "sanitized_preview": san.sanitized_text,
+            "redacted_entities": san.redacted_count,
+        }
+
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest, response: Response) -> Dict[str, Any]:
         if not req.messages:
