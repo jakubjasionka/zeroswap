@@ -208,16 +208,20 @@ def test_octop_batch_packed_zero_padding_decisions(shared_octop_plane: OctopCont
 def test_octop_long_context_overflow_sliding_window_needle_detection(
     shared_octop_plane: OctopControlPlane,
 ) -> None:
-    """Verifies Sliding-Window Super-Batch Chunking when LLM context exceeds d1-3B's chunk window.
+    """Verifies Sliding-Window Super-Batch Chunking with large passes and multi-thousand-token overlap.
 
     Embeds a secret API key + PII needle inside the middle chunk of a multi-chunk context
     while the first and last chunks are 100% benign mathematical code.
     """
+    assert shared_octop_plane.d1_engine.model.engine.token_budget == 262144
+    assert shared_octop_plane.d1_engine.max_chunk_tokens == 24576
+    assert shared_octop_plane.d1_engine.chunk_overlap_tokens == 4096
+
     benign_block = (
         "def matrix_multiply_block(A, B):\n"
         "    # Pure mathematical block matrix multiplication in Python\n"
         "    return [[sum(a * b for a, b in zip(row, col)) for col in zip(*B)] for row in A]\n"
-    ) * 20
+    ) * 180
     secret_needle = (
         "\n# INTERNAL PRODUCTION CREDENTIALS DO NOT SHARE:\n"
         "OPENAI_API_KEY = 'sk-proj-99887766554433221100aabbccddeeff'\n"
@@ -228,11 +232,12 @@ def test_octop_long_context_overflow_sliding_window_needle_detection(
 
     decision = shared_octop_plane.d1_engine.evaluate_octop_long_context(
         overflow_prompt,
-        max_chunk_tokens=256,
-        overlap_tokens=64,
+        max_chunk_tokens=2048,
+        overlap_tokens=1024,
     )
     overflow_meta = decision.raw_answers.get("long_context_overflow", {})
     assert overflow_meta.get("chunks_evaluated", 0) >= 3
+    assert overflow_meta["superbatch_telemetry"]["throughput_tokens_per_sec"] > 20000.0
     assert decision.output_tokens == 0
     assert decision.approved_for_external_api is False
     assert decision.safe_for_retention_prob < 0.35
